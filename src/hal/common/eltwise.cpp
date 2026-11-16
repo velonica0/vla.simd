@@ -18,6 +18,26 @@ using std::size_t;
 
 namespace tcpu {
 
+#if TCPU_HAL_RVV
+// RVV elementwise driver: OpenMP over fixed 256-element chunks (same threshold
+// as the other backends), vsetvl strip-mining inside, so no scalar tail.
+template <class F>
+static inline void rvv_map(int n, F&& body) {
+    const int nc = (n+255)/256;
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static) if(n > hal::env::omp_min())
+#endif
+    for (int c=0; c<nc; c++) {
+        const size_t end = (size_t)(c+1)*256 < (size_t)n ? (size_t)(c+1)*256 : (size_t)n;
+        for (size_t i=(size_t)c*256; i<end;) {
+            const size_t vl = __riscv_vsetvl_e32m4(end-i);
+            body(i, vl);
+            i += vl;
+        }
+    }
+}
+#endif
+
 // silu(g)*u = g/(1+exp(-g)) * u. Same treatment as gelu_tanh: std::exp is an
 // opaque libm call, so the loop cannot auto-vectorize (measured: one expf call
 // per element survives at -O3). The SIMD paths use the backend's Cephes exp -
@@ -27,6 +47,17 @@ namespace tcpu {
 // scalar: its only callers are Octo's diffusion head (64-1024 elements), where
 // there is nothing to win and the numerics are golden-verified as they are.
 void silu_gate(float* out, const float* g, const float* u, int n) {
+#if TCPU_HAL_RVV
+    if (hal::env::simd_silu()) {
+        rvv_map(n, [&](size_t i, size_t vl) {
+            const vfloat32m4_t x = __riscv_vle32_v_f32m4(g+i, vl);
+            const vfloat32m4_t e = exp_ps(__riscv_vfneg_v_f32m4(x, vl), vl);
+            const vfloat32m4_t s = __riscv_vfdiv_vv_f32m4(x, __riscv_vfadd_vf_f32m4(e, 1.0f, vl), vl);
+            __riscv_vse32_v_f32m4(out+i, __riscv_vfmul_vv_f32m4(s, __riscv_vle32_v_f32m4(u+i, vl), vl), vl);
+        });
+        return;
+    }
+#endif
 #if TCPU_HAL_X86 || TCPU_ISA_ARM
     if (hal::env::simd_silu()) {
         const int lanes = TCPU_HAL_X86 ? 8 : 4;
@@ -93,6 +124,17 @@ void gelu_tanh(float* x, int n) {
         float v = x[i];
         x[i] = 0.5f*v*(1.0f+std::tanh(c*(v+0.044715f*v*v*v)));
     }
+#elif TCPU_HAL_RVV
+    // Same sigmoid identity as the AVX2 / NEON paths (tolerance class).
+    rvv_map(n, [&](size_t i, size_t vl) {
+        const vfloat32m4_t v  = __riscv_vle32_v_f32m4(x+i, vl);
+        const vfloat32m4_t v3 = __riscv_vfmul_vv_f32m4(__riscv_vfmul_vv_f32m4(v, v, vl), v, vl);
+        const vfloat32m4_t y  = __riscv_vfmul_vf_f32m4(__riscv_vfmacc_vf_f32m4(v, 0.044715f, v3, vl),
+                                                       2.0f*c, vl);
+        const vfloat32m4_t e  = exp_ps(__riscv_vfneg_v_f32m4(y, vl), vl);
+        const vfloat32m4_t s  = __riscv_vfrdiv_vf_f32m4(__riscv_vfadd_vf_f32m4(e, 1.0f, vl), 1.0f, vl);
+        __riscv_vse32_v_f32m4(x+i, __riscv_vfmul_vv_f32m4(v, s, vl), vl);
+    });
 #elif TCPU_ISA_ARM
     // Same sigmoid identity as the AVX2 path: gelu = v * sigmoid(2c*(v+0.044715 v^3)),
     // one exp_ps per 4 elements instead of 4 scalar tanhf (11.7M calls across the
@@ -142,6 +184,32 @@ void gelu_tanh(float* x, int n) {
 // gelu_tanh is NOT a substitute for either path: see the header.
 void gelu_erf(float* x, int n) {
     const float inv_sqrt2 = 0.70710678118654752f;
+#if TCPU_HAL_RVV
+    if (hal::env::simd_erf()) {
+        const float p  =  0.3275911f;
+        const float a1 =  0.254829592f,  a2 = -0.284496736f, a3 = 1.421413741f;
+        const float a4 = -1.453152027f,  a5 =  1.061405429f;
+        rvv_map(n, [&](size_t i, size_t vl) {
+            const vfloat32m4_t v = __riscv_vle32_v_f32m4(x+i, vl);
+            const vfloat32m4_t z = __riscv_vfmul_vf_f32m4(__riscv_vfabs_v_f32m4(v, vl), inv_sqrt2, vl);
+            const vfloat32m4_t t = __riscv_vfrdiv_vf_f32m4(
+                __riscv_vfmacc_vf_f32m4(__riscv_vfmv_v_f_f32m4(1.0f, vl), p, z, vl), 1.0f, vl);
+            vfloat32m4_t poly = __riscv_vfmacc_vf_f32m4(__riscv_vfmv_v_f_f32m4(a4, vl), a5, t, vl);
+            poly = __riscv_vfmadd_vv_f32m4(poly, t, __riscv_vfmv_v_f_f32m4(a3, vl), vl);
+            poly = __riscv_vfmadd_vv_f32m4(poly, t, __riscv_vfmv_v_f_f32m4(a2, vl), vl);
+            poly = __riscv_vfmadd_vv_f32m4(poly, t, __riscv_vfmv_v_f_f32m4(a1, vl), vl);
+            poly = __riscv_vfmul_vv_f32m4(poly, t, vl);
+            const vfloat32m4_t e = exp_ps(__riscv_vfneg_v_f32m4(__riscv_vfmul_vv_f32m4(z, z, vl), vl), vl);
+            // erf(|x|/sqrt2) = 1 - poly*e, sign of x restored with vfsgnj
+            const vfloat32m4_t erf_abs = __riscv_vfnmsac_vv_f32m4(__riscv_vfmv_v_f_f32m4(1.0f, vl),
+                                                                  poly, e, vl);
+            const vfloat32m4_t erf = __riscv_vfsgnj_vv_f32m4(erf_abs, v, vl);
+            __riscv_vse32_v_f32m4(x+i, __riscv_vfmul_vv_f32m4(__riscv_vfmul_vf_f32m4(v, 0.5f, vl),
+                                                              __riscv_vfadd_vf_f32m4(erf, 1.0f, vl), vl), vl);
+        });
+        return;
+    }
+#endif
 #if TCPU_HAL_X86 || TCPU_ISA_ARM
     if (hal::env::simd_erf()) {
         const float p  =  0.3275911f;
@@ -220,6 +288,18 @@ void mish(float* x, int n) {
     // above that, tanh(softplus(v)) is 1 to well inside fp32, and the branch also
     // keeps log1p(exp(v)) from returning inf for the large activations the UNet's
     // wide channel blocks do produce.
+#if TCPU_HAL_RVV
+    if (hal::env::simd_mish()) {
+        rvv_map(n, [&](size_t i, size_t vl) {
+            const vfloat32m4_t v = __riscv_vle32_v_f32m4(x+i, vl);
+            const vfloat32m4_t e = exp_ps(__riscv_vfmin_vf_f32m4(v, 20.0f, vl), vl);
+            const vfloat32m4_t m = __riscv_vfmul_vv_f32m4(e, __riscv_vfadd_vf_f32m4(e, 2.0f, vl), vl);
+            const vfloat32m4_t t = __riscv_vfdiv_vv_f32m4(m, __riscv_vfadd_vf_f32m4(m, 2.0f, vl), vl);
+            __riscv_vse32_v_f32m4(x+i, __riscv_vfmul_vv_f32m4(v, t, vl), vl);
+        });
+        return;
+    }
+#endif
 #if TCPU_HAL_X86 || TCPU_ISA_ARM
     if (hal::env::simd_mish()) {
         const int lanes = TCPU_HAL_X86 ? 8 : 4;

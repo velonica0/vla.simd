@@ -85,6 +85,16 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86")
   # src/hal/avx2/gemm_i8.cpp opts in per-function behind a cpuid check.
   target_compile_options(vla_flags INTERFACE -mavx2 -mfma -mf16c)
   message(STATUS "vla_simd HAL: x86-avx2")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+  # RVV 1.0 with VLEN >= 256 (SpacemiT K3 X100 cores). _zvl256b lets the kernels
+  # treat one 16-wide packed weight column as one LMUL=2 group; src/hal/rvv
+  # refuses to load on a narrower part. -DVLA_RVV_FLAGS overrides the -march.
+  set(VLA_RVV_FLAGS "-march=rv64gcv_zba_zbb_zbs_zfh_zvfh_zvl256b" CACHE STRING "riscv64 -march flags")
+  set(VLA_RVV_MR "14" CACHE STRING "RVV fp32 GEMM register tile rows (1-14); 14 measured fastest on the K3 X100")
+  separate_arguments(VLA_RVV_FLAG_LIST NATIVE_COMMAND "${VLA_RVV_FLAGS}")
+  target_compile_options(vla_flags INTERFACE ${VLA_RVV_FLAG_LIST})
+  target_compile_definitions(vla_flags INTERFACE TCPU_RVV_MR=${VLA_RVV_MR})
+  message(STATUS "vla_simd HAL: rvv (${VLA_RVV_FLAGS}, tile ${VLA_RVV_MR}x16)")
 else()
   message(STATUS "vla_simd HAL: scalar (${CMAKE_SYSTEM_PROCESSOR})")
 endif()
@@ -183,6 +193,8 @@ add_library(tcpu_ops STATIC
   src/hal/neon/gemm.cpp
   src/hal/neon/gemm_i8.cpp
   src/hal/neon/attn.cpp
+  src/hal/rvv/gemm.cpp
+  src/hal/rvv/attn.cpp
   src/hal/scalar/gemm.cpp
   src/hal/scalar/attn.cpp
   src/hal/common/eltwise.cpp

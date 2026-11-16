@@ -82,6 +82,8 @@ bool Linear::bf16_keeps_raw() {
     return false;
 #elif TCPU_HAL_NEON
     return !hal::env::packed();
+#elif TCPU_HAL_RVV
+    return false;   // dequantize to fp32 packed panels; there is no native bf16 kernel
 #else
     return true;
 #endif

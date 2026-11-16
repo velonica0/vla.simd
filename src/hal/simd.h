@@ -16,4 +16,7 @@
 #elif TCPU_ISA_ARM
 #include "neon/simd.h"
 #define HAVE_SIMD 1
+#elif TCPU_HAL_RVV
+#include "rvv/simd.h"
+#define HAVE_SIMD 1
 #endif

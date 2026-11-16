@@ -19,7 +19,9 @@ using std::size_t;
 
 namespace tcpu {
 
-#if TCPU_HAL_X86
+#if TCPU_HAL_X86 || TCPU_HAL_RVV
+// These masked kernels take mask == nullptr as "no mask", so the dense op is a
+// direct call with no zero buffer to stream.
 void gqa_attention_dense(float* out, const float* Q, const float* K, const float* V,
                          int seq_q, int seq_k, int n_q, int n_kv, int head_dim,
                          float scale, const float* K_pre) {

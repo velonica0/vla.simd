@@ -25,6 +25,11 @@
 #elif defined(__ARM_NEON) && defined(__aarch64__)
   #define TCPU_HAL_NEON 1
   #define TCPU_HAL_NAME "neon"
+#elif defined(__riscv_vector) && defined(__riscv_v_min_vlen) && __riscv_v_min_vlen >= 256
+  // RVV 1.0 with VLEN >= 256 (SpacemiT K3 X100): one 16-wide packed weight
+  // column is one LMUL=2 register group. Narrower RVV parts take scalar.
+  #define TCPU_HAL_RVV 1
+  #define TCPU_HAL_NAME "rvv"
 #else
   #define TCPU_HAL_SCALAR 1
   #define TCPU_HAL_NAME "scalar"
@@ -38,6 +43,9 @@
 #endif
 #ifndef TCPU_HAL_NEON
   #define TCPU_HAL_NEON 0
+#endif
+#ifndef TCPU_HAL_RVV
+  #define TCPU_HAL_RVV 0
 #endif
 #ifndef TCPU_HAL_SCALAR
   #define TCPU_HAL_SCALAR 0

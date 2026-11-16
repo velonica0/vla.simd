@@ -26,7 +26,11 @@ dependencies = ["numpy>=2.2.6,<3"]
 #   uv pip install --index-url https://download.pytorch.org/whl/cpu torch
 serve = [
     "lerobot[async,feetech] @ git+https://github.com/khanhnd61-vr/lerobot@fa12de51f15836733c7ac55e973595f671d53e4f",
-    "torch>=2.11,<3",
+    "torch>=2.11,<3; platform_machine != 'riscv64'",
+    # riscv64 has no PyPI torch; the newest SpacemiT K3 build is 2.10, which the
+    # lerobot fork accepts (torch>=2.7,<2.12). The server only uses torch to
+    # resize frames and to type-check pickled tensors.
+    "torch>=2.10,<3; platform_machine == 'riscv64'",
 ]
 
 [project.scripts]
