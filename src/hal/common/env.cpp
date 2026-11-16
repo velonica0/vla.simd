@@ -191,6 +191,11 @@ bool bf16_deq() {
     return v;
 }
 
+bool ime() {
+    static const bool v = flag_on("TCPU_IME", false);
+    return v;
+}
+
 bool gemm_force_static() {
     static const bool v = [] {
         const char* e = std::getenv("TCPU_GEMM_SCHED");

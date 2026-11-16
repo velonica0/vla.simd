@@ -22,7 +22,29 @@ namespace nn {
 
 void Linear::init_bf16(const uint16_t* Wb16, const float* bias_, int N_, int K_, Role role_) {
     Wq = nullptr;
+    Wh = nullptr;
     packed_i8.clear();
+    packed_ime.clear();
+#if TCPU_HAL_RVV
+    // IME2 fp16 tiles straight from the bf16 blob (TCPU_IME=1, A100 cores).
+    if (role_ != Role::Generic && N_%16 == 0 && ime_available()) {
+        W    = nullptr;
+        bias = bias_;
+        N    = N_;
+        K    = K_;
+        role = role_;
+        Wp   = nullptr;
+        Wb   = nullptr;
+        Wr16 = nullptr;
+        packed.clear();
+        packed_bf16.clear();
+        deq.clear();
+        packed_ime.resize(ime_packed_size(N_, K_));
+        pack_weights_ime_bf16(Wb16, packed_ime.data(), N_, K_);
+        Wh = packed_ime.data();
+        return;
+    }
+#endif
 #if TCPU_HAL_NEON || TCPU_HAL_RVV
     // bf16 packed panels: identical values to the raw bf16 kernel, half the
     // bytes streamed vs fp32 (the Pi GEMMs are bandwidth-bound). TCPU_BF16_DEQ=1

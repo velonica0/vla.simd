@@ -125,6 +125,19 @@ void dense_linear_packed_add(float* out, const float* x, const float* Wp, const 
 void dense_linear_packed_bf16(float* out, const float* x, const uint16_t* Wp, const float* bias,
                               int seq, int N, int K);
 
+// SpacemiT IME2 fp16 GEMM (src/hal/rvv/ime.cpp; RVV builds with TCPU_RVV_IME).
+// ime_available() is true only with TCPU_IME=1 when every thread already runs on
+// an A100 core (VLEN 1024) and vfwmadot executes.
+// Weights are packed once into fp16 8x8 tiles (ime_packed_size uint16 words, N
+// must be a multiple of 16); dense_linear_ime rounds x to fp16 and accumulates
+// in fp32. Elsewhere ime_available() is false and the other two must not be called.
+bool ime_available();
+size_t ime_packed_size(int N, int K);
+void pack_weights_ime(const float* W, uint16_t* Wh, int N, int K);
+void pack_weights_ime_bf16(const uint16_t* Wb16, uint16_t* Wh, int N, int K);
+void dense_linear_ime(float* out, const float* x, const uint16_t* Wh, const float* bias,
+                      int seq, int N, int K);
+
 // Same GEMM, output stored TRANSPOSED: out_t[n*ldo + t] (in-register 8x8 transpose
 // epilogue, masked stores). Produces attention's K^T layout straight from the K
 // projection, skipping the separate transpose pass. Same accumulation order as

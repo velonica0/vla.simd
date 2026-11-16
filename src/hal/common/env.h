@@ -120,6 +120,13 @@ bool bf16_mlp();
 // defaults to bf16 panels. Other backends have a fixed policy (linear_bf16.cpp).
 bool bf16_deq();
 
+// TCPU_IME=1: on RVV builds with IME (TCPU_RVV_IME), run every packed Linear
+// through the IME2 vfwmadot fp16 GEMM. The process must already run on the K3's
+// A100 cores (start it after `echo $$ > /proc/set_ai_thread`). Lossy (fp16
+// activations and weights), so default off; ignored where the build or the CPU
+// has no IME.
+bool ime();
+
 // TCPU_GEMM_SCHED=static reverts the Pi packed GEMMs to static scheduling
 // (dynamic whole-panel is the measured ARM default).
 bool gemm_force_static();

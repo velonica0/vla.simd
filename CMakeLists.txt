@@ -97,6 +97,25 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
   target_compile_options(vla_flags INTERFACE ${VLA_RVV_FLAG_LIST})
   target_compile_definitions(vla_flags INTERFACE TCPU_RVV_MR=${VLA_RVV_MR})
   message(STATUS "vla_simd HAL: rvv (${VLA_RVV_FLAGS}, tile ${VLA_RVV_MR}x16)")
+  # SpacemiT IME2 (vfwmadot) for the K3's A100 cores: only src/hal/rvv/ime.cpp is
+  # built with _xsmtvdotii, and only when the assembler knows the instruction.
+  option(VLA_RVV_IME "build the SpacemiT IME2 fp16 GEMM (runtime opt-in TCPU_IME=1)" ON)
+  if(VLA_RVV_IME)
+    include(CheckCXXSourceCompiles)
+    set(VLA_RVV_IME_FLAGS "${VLA_RVV_FLAGS}_xsmtvdotii")
+    set(CMAKE_REQUIRED_FLAGS "${VLA_RVV_IME_FLAGS}")
+    check_cxx_source_compiles("int main() { __asm__ volatile(\"vfwmadot v2, v0, v1, fp16\"); }"
+                              VLA_RVV_HAVE_VFWMADOT)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(VLA_RVV_HAVE_VFWMADOT)
+      target_compile_definitions(vla_flags INTERFACE TCPU_RVV_IME=1)
+      separate_arguments(VLA_RVV_IME_FLAG_LIST NATIVE_COMMAND "${VLA_RVV_IME_FLAGS}")
+      set_source_files_properties(src/hal/rvv/ime.cpp PROPERTIES COMPILE_OPTIONS "${VLA_RVV_IME_FLAG_LIST}")
+      message(STATUS "vla_simd HAL: rvv + IME2 vfwmadot (TCPU_IME=1)")
+    else()
+      message(STATUS "vla_simd HAL: rvv, no IME (assembler lacks vfwmadot)")
+    endif()
+  endif()
 else()
   message(STATUS "vla_simd HAL: scalar (${CMAKE_SYSTEM_PROCESSOR})")
 endif()
@@ -197,6 +216,7 @@ add_library(tcpu_ops STATIC
   src/hal/neon/attn.cpp
   src/hal/rvv/gemm.cpp
   src/hal/rvv/attn.cpp
+  src/hal/rvv/ime.cpp
   src/hal/scalar/gemm.cpp
   src/hal/scalar/attn.cpp
   src/hal/common/eltwise.cpp

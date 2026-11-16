@@ -155,6 +155,16 @@ static void test_linear() {
 #endif
         }
 
+        // IME2 fp16 tiles (TCPU_IME=1 on the K3's A100 cores only): x and W are
+        // rounded to fp16 (unit roundoff 2^-11 each), accumulation is fp32.
+        if (ime_available()) {
+            std::vector<uint16_t> Wh(ime_packed_size(N, K));
+            std::vector<float> yh((size_t)seq*N);
+            pack_weights_ime(W.data(), Wh.data(), N, K);
+            dense_linear_ime(yh.data(), x.data(), Wh.data(), b.data(), seq, N, K);
+            expect_close("dense_linear_ime", yh, ref, mag, 2e-3);
+        }
+
         const int ldo = hal::kt_stride(seq);
         std::vector<float> kt((size_t)N*ldo, 0.f), ktt((size_t)seq*N);
         dense_linear_packed_kt(kt.data(), x.data(), Wp.data(), b.data(), seq, N, K, ldo);

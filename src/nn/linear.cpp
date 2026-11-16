@@ -30,11 +30,22 @@ void Linear::init(const float* W_, const float* bias_, int N_, int K_, Role role
     Wb   = nullptr;
     Wr16 = nullptr;
     Wq   = nullptr;
+    Wh   = nullptr;
     packed.clear();
     packed_bf16.clear();
     packed_i8.clear();
+    packed_ime.clear();
 
     if (role == Role::Generic || (TCPU_HAL_APPLE && accel_on())) return;
+
+    // IME2 fp16 tiles on the K3's A100 cores (TCPU_IME=1); W stays as the raw
+    // fallback the int8 packer can read.
+    if (N%16 == 0 && ime_available()) {
+        packed_ime.resize(ime_packed_size(N, K));
+        pack_weights_ime(W, packed_ime.data(), N, K);
+        Wh = packed_ime.data();
+        return;
+    }
 
     // Pack once for the packed-panel kernel (TCPU_PACKED=0 keeps the raw path;
     // the packer produces N/16 full blocks, so N must be a multiple of 16).
@@ -109,8 +120,11 @@ bool Linear::init_int8() {
     packed.shrink_to_fit();
     packed_bf16.clear();
     packed_bf16.shrink_to_fit();
+    packed_ime.clear();
+    packed_ime.shrink_to_fit();
     Wp = nullptr;
     Wb = nullptr;
+    Wh = nullptr;
     return true;
 }
 
@@ -119,6 +133,11 @@ bool Linear::init_int8() {
 // the Cortex-A72 attention path.
 
 void Linear::forward(float* out, const float* x, int seq) const {
+    if (Wh) {
+        dense_linear_ime(out, x, Wh, bias, seq, N, K);
+        return;
+    }
+
     if (Wq) {
         // thread_local, not a member: the view fan-out runs several threads
         // through one Linear, and per-object scratch raced. One buffer per thread

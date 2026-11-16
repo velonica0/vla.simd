@@ -93,8 +93,10 @@ struct Linear {
     const uint16_t* Wb = nullptr;       // bf16 packed panels (Pi Mlp opt-in, or init_bf16)
     const uint16_t* Wr16 = nullptr;     // raw bf16 [N,K] (init_bf16 keeps-raw paths)
     const int8_t* Wq = nullptr;         // int8 panels (init_int8)
+    const uint16_t* Wh = nullptr;       // IME fp16 tiles (RVV, TCPU_IME=1)
     std::vector<float> packed;
     std::vector<uint16_t> packed_bf16;
+    std::vector<uint16_t> packed_ime;   // fp16 bits, [N/16][K8][2][8][8]
     std::vector<float> deq;             // owned fp32 dequant of a bf16 checkpoint
     std::vector<int32_t> packed_i8;   // int32-typed: see packed_i8_words
     std::vector<float> wscale;          // per-output-row weight scale
