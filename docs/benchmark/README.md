@@ -29,4 +29,7 @@ build, model configurations, engine settings, memory, and the full thread sweep.
 Reproduce a device with `tools/bench_sweep.py` from a Release build of that commit; the Snapdragon X
 report also covers the Windows on Arm build and its register-tile selection.
 
+The SpacemiT K3 (RISC-V, RVV backend) ran SmolVLA and TurboVLA only, on a later commit, so it is
+not in the table: see [spacemit-k3.md](spacemit-k3.md) (FP32 5,207 ms and 805.0 ms).
+
 The audit and parity report is [intel-core-ultra-9-285k.md](intel-core-ultra-9-285k.md).
