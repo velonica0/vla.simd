@@ -16,6 +16,11 @@
 // head_dim strip of each V row loaded once and FMA'd into all QT outputs; keys
 // whose weight is zero in every row of the tile are skipped. The dense op comes
 // from hal/common/attn.cpp (this path with a zero mask).
+//
+// K^T and score rows are padded by ROW_PAD floats. At seq_k = 1024 (the SigLIP
+// ViT) an unpadded row is exactly 4 KB, so the head_dim rows of a QK slice and
+// the QT weight rows of an AV tile all land in the same L1 sets; padding took
+// the 8-thread op from 84.6 to 38.3 ms on the K3 at that shape, bit-identical.
 
 #include "../arch.h"
 #if TCPU_HAL_RVV
@@ -31,31 +36,39 @@ namespace tcpu {
 
 namespace {
 
-constexpr int QT = 4;    // queries per register micro-tile
-constexpr int QB = 16;   // queries per cache block: one pass over K^T / V serves QB/QT tiles
+// QT = 7: seven LMUL=4 accumulators plus the K^T / V load use all 32 vector
+// registers, 7 FMAs per load. 4 -> 7 took the padded op from 38.3 to 27.9 ms.
+constexpr int QT = 7;    // queries per register micro-tile
+constexpr int QB = 28;   // queries per cache block: one pass over K^T / V serves QB/QT tiles
+constexpr size_t ROW_PAD = 16;   // floats appended to each K^T and score row
 constexpr size_t KS = 128;   // keys per QK slice (head_dim x 128 floats of K^T, L1-resident)
 
 // Score rows for `rows` (<= QT) queries against all keys of one kv head.
-// sc is QT x seq_k. Applies scale and the mask; blocked keys become -inf.
-inline void qk_tile(float* sc, const float* const* q, int rows, const float* kt,
-                    int seq_k, int head_dim, float scale, const float* const* mrow,
+// sc holds QT rows of scs floats. Applies scale and the mask; blocked keys become -inf.
+// kt rows are ld floats apart, sc rows scs floats apart.
+inline void qk_tile(float* sc, size_t scs, const float* const* q, int rows, const float* kt,
+                    size_t ld, int head_dim, float scale, const float* const* mrow,
                     size_t j0, size_t j1) {
     const float NINF  = -std::numeric_limits<float>::infinity();
     const float BLOCK = std::numeric_limits<float>::lowest();
     for (size_t j = j0; j < j1;) {
         const size_t vl = __riscv_vsetvl_e32m4(j1 - j);
         vfloat32m4_t a0 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
-        vfloat32m4_t a1 = a0, a2 = a0, a3 = a0;
+        vfloat32m4_t a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0;
         const float* kp = kt + j;
-        for (int d = 0; d < head_dim; d++, kp += seq_k) {
+        for (int d = 0; d < head_dim; d++, kp += ld) {
             const vfloat32m4_t kv = __riscv_vle32_v_f32m4(kp, vl);
             a0 = __riscv_vfmacc_vf_f32m4(a0, q[0][d], kv, vl);
             if (rows > 1) a1 = __riscv_vfmacc_vf_f32m4(a1, q[1][d], kv, vl);
             if (rows > 2) a2 = __riscv_vfmacc_vf_f32m4(a2, q[2][d], kv, vl);
             if (rows > 3) a3 = __riscv_vfmacc_vf_f32m4(a3, q[3][d], kv, vl);
+            if (rows > 4) a4 = __riscv_vfmacc_vf_f32m4(a4, q[4][d], kv, vl);
+            if (rows > 5) a5 = __riscv_vfmacc_vf_f32m4(a5, q[5][d], kv, vl);
+            if (rows > 6) a6 = __riscv_vfmacc_vf_f32m4(a6, q[6][d], kv, vl);
         }
         for (int r = 0; r < rows; r++) {
-            const vfloat32m4_t a = r == 0 ? a0 : r == 1 ? a1 : r == 2 ? a2 : a3;
+            const vfloat32m4_t a = r == 0 ? a0 : r == 1 ? a1 : r == 2 ? a2 : r == 3 ? a3
+                                 : r == 4 ? a4 : r == 5 ? a5 : a6;
             vfloat32m4_t s = __riscv_vfmul_vf_f32m4(a, scale, vl);
             if (mrow[r]) {
                 const vfloat32m4_t m = __riscv_vle32_v_f32m4(mrow[r] + j, vl);
@@ -63,7 +76,7 @@ inline void qk_tile(float* sc, const float* const* q, int rows, const float* kt,
                 const vbool8_t blk = __riscv_vmfeq_vf_f32m4_b8(m, BLOCK, vl);
                 s = __riscv_vfmerge_vfm_f32m4(s, NINF, blk, vl);
             }
-            __riscv_vse32_v_f32m4(sc + (size_t)r*seq_k + j, s, vl);
+            __riscv_vse32_v_f32m4(sc + (size_t)r*scs + j, s, vl);
         }
         j += vl;
     }
@@ -98,32 +111,46 @@ inline float softmax_row(float* sc, int seq_k) {
 
 // o[r][d0:d1] = sum_t w[r][t] * V[t][d0:d1] (weights already normalized). vs is
 // the packed V strip for [d0, d1): seq_k rows of DS floats, contiguous.
-inline void av_tile(float* const* o, const float* w, int rows, const float* vs, size_t DS,
-                    int seq_k, size_t d0, size_t d1) {
+// w rows are scs floats apart.
+inline void av_tile(float* const* o, const float* w, size_t scs, int rows, const float* vs,
+                    size_t DS, int seq_k, size_t d0, size_t d1) {
     {
         const size_t d  = d0;
         const size_t vl = __riscv_vsetvl_e32m4(d1 - d0);
         vfloat32m4_t o0 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
-        vfloat32m4_t o1 = o0, o2 = o0, o3 = o0;
-        const float* w1 = w + seq_k;
-        const float* w2 = w + 2*(size_t)seq_k;
-        const float* w3 = w + 3*(size_t)seq_k;
+        vfloat32m4_t o1 = o0, o2 = o0, o3 = o0, o4 = o0, o5 = o0, o6 = o0;
+        const float* w1 = w + scs;
+        const float* w2 = w + 2*scs;
+        const float* w3 = w + 3*scs;
+        const float* w4 = w + 4*scs;
+        const float* w5 = w + 5*scs;
+        const float* w6 = w + 6*scs;
         for (int t = 0; t < seq_k; t++) {
             const float x0 = w[t];
             const float x1 = rows > 1 ? w1[t] : 0.0f;
             const float x2 = rows > 2 ? w2[t] : 0.0f;
             const float x3 = rows > 3 ? w3[t] : 0.0f;
-            if (x0 == 0.0f && x1 == 0.0f && x2 == 0.0f && x3 == 0.0f) continue;
+            const float x4 = rows > 4 ? w4[t] : 0.0f;
+            const float x5 = rows > 5 ? w5[t] : 0.0f;
+            const float x6 = rows > 6 ? w6[t] : 0.0f;
+            if (x0 == 0.0f && x1 == 0.0f && x2 == 0.0f && x3 == 0.0f && x4 == 0.0f &&
+                x5 == 0.0f && x6 == 0.0f) continue;
             const vfloat32m4_t v = __riscv_vle32_v_f32m4(vs + (size_t)t*DS, vl);
             o0 = __riscv_vfmacc_vf_f32m4(o0, x0, v, vl);
             if (rows > 1) o1 = __riscv_vfmacc_vf_f32m4(o1, x1, v, vl);
             if (rows > 2) o2 = __riscv_vfmacc_vf_f32m4(o2, x2, v, vl);
             if (rows > 3) o3 = __riscv_vfmacc_vf_f32m4(o3, x3, v, vl);
+            if (rows > 4) o4 = __riscv_vfmacc_vf_f32m4(o4, x4, v, vl);
+            if (rows > 5) o5 = __riscv_vfmacc_vf_f32m4(o5, x5, v, vl);
+            if (rows > 6) o6 = __riscv_vfmacc_vf_f32m4(o6, x6, v, vl);
         }
         __riscv_vse32_v_f32m4(o[0] + d, o0, vl);
         if (rows > 1) __riscv_vse32_v_f32m4(o[1] + d, o1, vl);
         if (rows > 2) __riscv_vse32_v_f32m4(o[2] + d, o2, vl);
         if (rows > 3) __riscv_vse32_v_f32m4(o[3] + d, o3, vl);
+        if (rows > 4) __riscv_vse32_v_f32m4(o[4] + d, o4, vl);
+        if (rows > 5) __riscv_vse32_v_f32m4(o[5] + d, o5, vl);
+        if (rows > 6) __riscv_vse32_v_f32m4(o[6] + d, o6, vl);
     }
 }
 
@@ -142,7 +169,9 @@ void gqa_attention_masked(float* out, const float* Q, const float* K, const floa
     const size_t DS = __riscv_vsetvlmax_e32m4();
     const int nstrip = (int)(((size_t)head_dim+DS-1)/DS);
     static thread_local std::vector<float> kt_buf, vp_buf;
-    const size_t kt_n = (size_t)n_kv*head_dim*seq_k;
+    const size_t ld  = (size_t)seq_k + ROW_PAD;   // K^T row stride
+    const size_t scs = ld;                         // score row stride
+    const size_t kt_n = (size_t)n_kv*head_dim*ld;
     const size_t vp_n = (size_t)n_kv*nstrip*seq_k*DS;
     if (kt_buf.size() < kt_n) kt_buf.resize(kt_n);
     if (vp_buf.size() < vp_n) vp_buf.resize(vp_n);
@@ -162,7 +191,7 @@ void gqa_attention_masked(float* out, const float* Q, const float* K, const floa
     for (int kv=0; kv<n_kv; kv++)
         for (int d=0; d<head_dim; d++) {
             const float* src = K+(size_t)kv*head_dim+d;
-            float* dst = kt+((size_t)kv*head_dim+d)*seq_k;
+            float* dst = kt+((size_t)kv*head_dim+d)*ld;
             const ptrdiff_t stride = (ptrdiff_t)n_kv*head_dim*sizeof(float);
             for (size_t t = 0, n = (size_t)seq_k; t < n;) {
                 const size_t vl = __riscv_vsetvl_e32m4(n - t);
@@ -192,7 +221,7 @@ void gqa_attention_masked(float* out, const float* Q, const float* K, const floa
     // Without it every 4-query tile re-streams the head's whole K^T and V panels
     // (~300 KB at ACT's seq 602), and the 8-thread op is bandwidth-bound.
     const int qblocks = (seq_q+QB-1)/QB;
-    std::vector<float> sc((size_t)QB*seq_k);   // per-thread score block
+    std::vector<float> sc((size_t)QB*scs);   // per-thread score block
 #if defined(_OPENMP)
     #pragma omp for schedule(dynamic, 1) collapse(2)
 #endif
@@ -211,17 +240,17 @@ void gqa_attention_masked(float* out, const float* Q, const float* K, const floa
                 mrow[r] = mask ? mask+(size_t)t1*seq_k : nullptr;
                 o[r]    = out+((size_t)t1*n_q+h)*head_dim;
             }
-            const float* ktp = kt+(size_t)kv*head_dim*seq_k;
+            const float* ktp = kt+(size_t)kv*head_dim*ld;
             for (size_t j=0; j<(size_t)seq_k; j+=KS) {
                 const size_t j1 = j+KS < (size_t)seq_k ? j+KS : (size_t)seq_k;
                 for (int m=0; m<ntile; m++) {
                     const int rows = nbq-m*QT < QT ? nbq-m*QT : QT;
-                    qk_tile(sc.data()+(size_t)m*QT*seq_k, q+m*QT, rows, ktp, seq_k, head_dim,
+                    qk_tile(sc.data()+(size_t)m*QT*scs, scs, q+m*QT, rows, ktp, ld, head_dim,
                             scale, mrow+m*QT, j, j1);
                 }
             }
             for (int r=0; r<nbq; r++) {
-                float* row = sc.data()+(size_t)r*seq_k;
+                float* row = sc.data()+(size_t)r*scs;
                 const float inv = softmax_row(row, seq_k);
                 for (size_t i = 0, n = (size_t)seq_k; i < n;) {
                     const size_t vl = __riscv_vsetvl_e32m4(n - i);
@@ -236,7 +265,7 @@ void gqa_attention_masked(float* out, const float* Q, const float* K, const floa
                 const float* vs = vp+((size_t)kv*nstrip+st)*seq_k*DS;
                 for (int m=0; m<ntile; m++) {
                     const int rows = nbq-m*QT < QT ? nbq-m*QT : QT;
-                    av_tile(o+m*QT, sc.data()+(size_t)m*QT*seq_k, rows, vs, DS, seq_k, d, d1);
+                    av_tile(o+m*QT, sc.data()+(size_t)m*QT*scs, scs, rows, vs, DS, seq_k, d, d1);
                 }
             }
         }
