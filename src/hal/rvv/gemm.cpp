@@ -21,8 +21,10 @@
 #include "../common/env.h"
 #include "../../ops/lm_ops.h"
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 using std::size_t;
 
 #ifndef TCPU_RVV_MR
@@ -237,6 +239,144 @@ void dense_linear_packed(float* out, const float* x, const float* Wp, const floa
             const int rows = seq-t0 < MR ? seq-t0 : MR;
             mm_pack_dispatch<MR>(out+(size_t)t0*N, x+(size_t)t0*K,
                                  Wp+(size_t)b*K*16, bias, rows, N, K, b*16);
+        }
+    }
+}
+
+// ---- bf16 packed panels (Linear::init_bf16 with TCPU_BF16_DEQ=0) ----------
+//
+// Same [b][k][16] panel layout, MR x 16 tile, k unroll and schedule as the fp32
+// kernel above, with the weights kept as bf16 (half the bytes).
+//
+// With Zvfbfwma (the K3 X100 has it, though /proc/cpuinfo does not list it) the
+// activations are rounded to bf16 once per call and each step is one
+// vfwmaccbf16.vf (bf16 x bf16, fp32 accumulate): 1.3-1.7x the fp32 kernel at
+// SmolVLA's shapes, at ~1.7e-3 relative error from the activation rounding.
+// Without it, each 16-wide bf16 column is widened exactly to fp32 (zero-extend,
+// shift into the high half) and the fp32 vfmacc runs on fp32 activations, so the
+// result equals the fp32 kernel on the dequantized weights.
+#define TCPU_RVV_R14(OP) OP(0) OP(1) OP(2) OP(3) OP(4) OP(5) OP(6) OP(7) OP(8) OP(9) \
+                         OP(10) OP(11) OP(12) OP(13)
+#define TCPU_RVV_ACC(i) vfloat32m2_t c##i = __riscv_vfmv_v_f_f32m2(0.0f, VL);
+#define TCPU_RVV_STORE(i) if constexpr (ROWS > i) \
+    __riscv_vse32_v_f32m2(out+(size_t)i*N+n0, __riscv_vfadd_vv_f32m2(c##i, bb, VL), VL);
+
+#if defined(__riscv_zvfbfwma)
+using bf16x_t = __bf16;
+template <int ROWS>
+static inline void mm_pack_rows16_bf16_rvv(float* out, const __bf16* x, const uint16_t* wp,
+                                           const float* bias, int N, int K, int n0) {
+    constexpr size_t VL = 16;
+    const size_t ks = (size_t)K;
+    TCPU_RVV_R14(TCPU_RVV_ACC)
+    auto ld = [&](size_t k) {
+        return __riscv_vreinterpret_v_u16m1_bf16m1(__riscv_vle16_v_u16m1(wp+k*16, VL));
+    };
+#define TCPU_RVV_F0(i) if constexpr (ROWS > i) c##i = __riscv_vfwmaccbf16_vf_f32m2(c##i, x[i*ks+k], b0, VL);
+#define TCPU_RVV_F1(i) if constexpr (ROWS > i) c##i = __riscv_vfwmaccbf16_vf_f32m2(c##i, x[i*ks+k+1], b1, VL);
+    size_t k = 0;
+    for (; k+2<=ks; k+=2) {
+        const vbfloat16m1_t b0 = ld(k), b1 = ld(k+1);
+        TCPU_RVV_R14(TCPU_RVV_F0)
+        TCPU_RVV_R14(TCPU_RVV_F1)
+    }
+    for (; k<ks; k++) {
+        const vbfloat16m1_t b0 = ld(k);
+        TCPU_RVV_R14(TCPU_RVV_F0)
+    }
+#undef TCPU_RVV_F0
+#undef TCPU_RVV_F1
+    const vfloat32m2_t bb = bias ? __riscv_vle32_v_f32m2(bias+n0, VL) : __riscv_vfmv_v_f_f32m2(0.0f, VL);
+    TCPU_RVV_R14(TCPU_RVV_STORE)
+}
+#else
+using bf16x_t = float;
+template <int ROWS>
+static inline void mm_pack_rows16_bf16_rvv(float* out, const float* x, const uint16_t* wp,
+                                           const float* bias, int N, int K, int n0) {
+    constexpr size_t VL = 16;
+    const size_t ks = (size_t)K;
+    TCPU_RVV_R14(TCPU_RVV_ACC)
+    auto ld = [&](size_t k) {   // bf16 -> fp32, exact: the bf16 bits become the high half
+        return __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vsll_vx_u32m2(
+            __riscv_vzext_vf2_u32m2(__riscv_vle16_v_u16m1(wp+k*16, VL), VL), 16, VL));
+    };
+#define TCPU_RVV_F0(i) if constexpr (ROWS > i) c##i = __riscv_vfmacc_vf_f32m2(c##i, x[i*ks+k], b0, VL);
+#define TCPU_RVV_F1(i) if constexpr (ROWS > i) c##i = __riscv_vfmacc_vf_f32m2(c##i, x[i*ks+k+1], b1, VL);
+    size_t k = 0;
+    for (; k+2<=ks; k+=2) {
+        const vfloat32m2_t b0 = ld(k), b1 = ld(k+1);
+        TCPU_RVV_R14(TCPU_RVV_F0)
+        TCPU_RVV_R14(TCPU_RVV_F1)
+    }
+    for (; k<ks; k++) {
+        const vfloat32m2_t b0 = ld(k);
+        TCPU_RVV_R14(TCPU_RVV_F0)
+    }
+#undef TCPU_RVV_F0
+#undef TCPU_RVV_F1
+    const vfloat32m2_t bb = bias ? __riscv_vle32_v_f32m2(bias+n0, VL) : __riscv_vfmv_v_f_f32m2(0.0f, VL);
+    TCPU_RVV_R14(TCPU_RVV_STORE)
+}
+#endif
+#undef TCPU_RVV_ACC
+#undef TCPU_RVV_STORE
+#undef TCPU_RVV_R14
+
+template <int R>
+static inline void mm_pack_bf16_dispatch(float* out, const bf16x_t* x, const uint16_t* wp,
+                                         const float* bias, int rows, int N, int K, int n0) {
+    if constexpr (R > 1) {
+        if (rows < R) {
+            mm_pack_bf16_dispatch<R-1>(out, x, wp, bias, rows, N, K, n0);
+            return;
+        }
+    }
+    mm_pack_rows16_bf16_rvv<R>(out, x, wp, bias, N, K, n0);
+}
+
+void dense_linear_packed_bf16(float* out, const float* x, const uint16_t* Wp, const float* bias,
+                              int seq, int N, int K) {
+    constexpr int MR = TCPU_RVV_MR;
+    const int nblocks = N/16;
+    const int mtiles  = (seq+MR-1)/MR;
+#if defined(__riscv_zvfbfwma)
+    // One rounding pass (RNE) per call; thread_local because the view fan-out
+    // runs several threads through one Linear.
+    static thread_local std::vector<__bf16> xb_buf;
+    const size_t nx = (size_t)seq*K;
+    if (xb_buf.size() < nx) xb_buf.resize(nx);
+    __bf16* xb = xb_buf.data();
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static) if((long)nx > hal::env::omp_min())
+#endif
+    for (long i=0; i<(long)nx; i++)
+        xb[i] = (__bf16)x[i];
+    const bf16x_t* xs = xb;
+#else
+    const bf16x_t* xs = x;
+#endif
+#if defined(_OPENMP)
+    if (!gemm_force_static()) {
+        #pragma omp parallel for schedule(dynamic, mtiles) collapse(2)
+        for (int b=0; b<nblocks; b++) {
+            for (int m=0; m<mtiles; m++) {
+                const int t0   = m*MR;
+                const int rows = seq-t0 < MR ? seq-t0 : MR;
+                mm_pack_bf16_dispatch<MR>(out+(size_t)t0*N, xs+(size_t)t0*K,
+                                          Wp+(size_t)b*K*16, bias, rows, N, K, b*16);
+            }
+        }
+        return;
+    }
+    #pragma omp parallel for schedule(static) collapse(2)
+#endif
+    for (int b=0; b<nblocks; b++) {
+        for (int m=0; m<mtiles; m++) {
+            const int t0   = m*MR;
+            const int rows = seq-t0 < MR ? seq-t0 : MR;
+            mm_pack_bf16_dispatch<MR>(out+(size_t)t0*N, xs+(size_t)t0*K,
+                                      Wp+(size_t)b*K*16, bias, rows, N, K, b*16);
         }
     }
 }

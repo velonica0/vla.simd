@@ -126,6 +126,35 @@ static void test_linear() {
         dense_linear_packed(yp.data(), x.data(), Wp.data(), b.data(), seq, N, K);
         expect_close("dense_linear_packed", yp, ref, mag, 1e-5);
 
+        // bf16 panels: reference on the bf16-rounded weights. The RVV Zvfbfwma
+        // kernel also rounds x to bf16 (unit roundoff 2^-8); every other kernel
+        // keeps x in fp32.
+        {
+            std::vector<uint16_t> Wpb((size_t)N*K);
+            std::vector<float> Wr((size_t)N*K), yb((size_t)seq*N);
+            for (size_t i = 0; i < Wr.size(); i++) {
+                uint32_t u;
+                std::memcpy(&u, &W[i], 4);
+                const uint16_t h = (uint16_t)((u + 0x7fff + ((u >> 16) & 1)) >> 16);
+                Wr[i] = bf16_f32(h);
+            }
+            for (int bl = 0; bl < N/16; bl++)
+                for (int k = 0; k < K; k++)
+                    for (int j = 0; j < 16; j++) {
+                        uint32_t u;
+                        std::memcpy(&u, &Wr[(size_t)(bl*16+j)*K+k], 4);
+                        Wpb[((size_t)bl*K+k)*16+j] = (uint16_t)(u >> 16);
+                    }
+            std::vector<double> rb, mb;
+            naive_linear(rb, mb, x.data(), Wr.data(), b.data(), seq, N, K);
+            dense_linear_packed_bf16(yb.data(), x.data(), Wpb.data(), b.data(), seq, N, K);
+#if TCPU_HAL_RVV && defined(__riscv_zvfbfwma)
+            expect_close("dense_linear_packed_bf16", yb, rb, mb, 4e-3);
+#else
+            expect_close("dense_linear_packed_bf16", yb, rb, mb, 1e-5);
+#endif
+        }
+
         const int ldo = hal::kt_stride(seq);
         std::vector<float> kt((size_t)N*ldo, 0.f), ktt((size_t)seq*N);
         dense_linear_packed_kt(kt.data(), x.data(), Wp.data(), b.data(), seq, N, K, ldo);

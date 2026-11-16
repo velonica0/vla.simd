@@ -120,7 +120,8 @@ void dense_linear_packed_add(float* out, const float* x, const float* Wp, const 
 
 // As dense_linear_packed, but the packed weights are bf16 (top 16 bits of the fp32,
 // same [b][k][16] layout) - halves the weight bytes streamed, for memory-bound GEMMs.
-// Not bit-exact (weights lose 16 mantissa bits). NEON kernel; scalar fallback.
+// Not bit-exact (weights lose 16 mantissa bits). NEON and RVV kernels; scalar
+// fallback. The RVV kernel with Zvfbfwma also rounds x to bf16 (vfwmaccbf16).
 void dense_linear_packed_bf16(float* out, const float* x, const uint16_t* Wp, const float* bias,
                               int seq, int N, int K);
 

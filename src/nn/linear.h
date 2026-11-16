@@ -31,7 +31,8 @@ struct Linear {
     // checkpoints). Per-backend policy: x86 dequantizes once into packed fp32
     // panels (TCPU_BF16_DEQ=0 keeps the raw bf16 + native bf16 row GEMM); Apple
     // dequantizes once and routes to Accelerate; Pi NEON packs bf16 panels
-    // (half the bytes streamed - its GEMMs are bandwidth-bound); scalar keeps
+    // (half the bytes streamed - its GEMMs are bandwidth-bound); RVV packs fp32
+    // panels, or bf16 panels with TCPU_BF16_DEQ=0 (Zvfbfwma kernel); scalar keeps
     // the raw pointer. Unless bf16_keeps_raw(), every path owns a copy and the
     // caller may free the bf16 blob after all init_bf16 calls.
     void init_bf16(const uint16_t* Wb16, const float* bias, int N, int K, Role role);

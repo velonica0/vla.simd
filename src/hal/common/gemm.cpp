@@ -58,9 +58,9 @@ void dense_linear_bf16(float* out, const float* x, const uint16_t* W, const floa
 }
 #endif // !TCPU_HAL_X86
 
-#if !TCPU_HAL_NEON
-// bf16 packed-panel GEMM: native only on the Pi NEON backend (the one place it
-// was measured to win); reference loop elsewhere.
+#if !TCPU_HAL_NEON && !TCPU_HAL_RVV
+// bf16 packed-panel GEMM: native on the Pi NEON and RVV backends (where it was
+// measured to win); reference loop elsewhere.
 void dense_linear_packed_bf16(float* out, const float* x, const uint16_t* Wp, const float* bias,
                               int seq, int N, int K) {
     for (int n=0; n<N; n++) {
@@ -75,6 +75,6 @@ void dense_linear_packed_bf16(float* out, const float* x, const uint16_t* Wp, co
         }
     }
 }
-#endif // !TCPU_HAL_NEON
+#endif // !TCPU_HAL_NEON && !TCPU_HAL_RVV
 
 } // namespace tcpu

@@ -115,7 +115,9 @@ bool bf16_mlp();
 // TCPU_BF16_DEQ=0: x86 keeps bf16-checkpoint weights resident and runs the
 // native bf16 row GEMM instead of dequantizing to packed fp32 panels at load
 // (Linear::init_bf16). Default on: the packed panels measured faster on i9,
-// at 2x the weight RAM. Other backends have a fixed policy (see linear.cpp).
+// at 2x the weight RAM. RVV: =0 packs bf16 panels for the Zvfbfwma kernel,
+// which rounds activations to bf16 (default on = exact fp32 panels). NEON
+// defaults to bf16 panels. Other backends have a fixed policy (linear_bf16.cpp).
 bool bf16_deq();
 
 // TCPU_GEMM_SCHED=static reverts the Pi packed GEMMs to static scheduling

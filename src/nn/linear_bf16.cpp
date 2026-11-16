@@ -23,11 +23,13 @@ namespace nn {
 void Linear::init_bf16(const uint16_t* Wb16, const float* bias_, int N_, int K_, Role role_) {
     Wq = nullptr;
     packed_i8.clear();
-#if TCPU_HAL_NEON
+#if TCPU_HAL_NEON || TCPU_HAL_RVV
     // bf16 packed panels: identical values to the raw bf16 kernel, half the
     // bytes streamed vs fp32 (the Pi GEMMs are bandwidth-bound). TCPU_BF16_DEQ=1
     // opts into fp32 panels for A/B (2x weight RAM - the full model then
-    // exceeds a 4GB Pi; module tests only).
+    // exceeds a 4GB Pi; module tests only). On RVV it is the other way round:
+    // fp32 panels by default, TCPU_BF16_DEQ=0 opts into bf16 panels, whose
+    // Zvfbfwma kernel also rounds the activations to bf16 (faster, not exact).
     if (role_ != Role::Generic && hal::env::packed() && N_%16 == 0 && !hal::env::bf16_deq()) {
         W    = nullptr;
         bias = bias_;
@@ -83,7 +85,7 @@ bool Linear::bf16_keeps_raw() {
 #elif TCPU_HAL_NEON
     return !hal::env::packed();
 #elif TCPU_HAL_RVV
-    return false;   // dequantize to fp32 packed panels; there is no native bf16 kernel
+    return false;   // fp32 packed panels, or bf16 panels with TCPU_BF16_DEQ=0
 #else
     return true;
 #endif

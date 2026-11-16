@@ -88,8 +88,10 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
   # RVV 1.0 with VLEN >= 256 (SpacemiT K3 X100 cores). _zvl256b lets the kernels
   # treat one 16-wide packed weight column as one LMUL=2 group; src/hal/rvv
-  # refuses to load on a narrower part. -DVLA_RVV_FLAGS overrides the -march.
-  set(VLA_RVV_FLAGS "-march=rv64gcv_zba_zbb_zbs_zfh_zvfh_zvl256b" CACHE STRING "riscv64 -march flags")
+  # refuses to load on a narrower part. _zvfbfwma enables the bf16 panel kernel
+  # (TCPU_BF16_DEQ=0); the K3 X100 implements it although /proc/cpuinfo does not
+  # list it. -DVLA_RVV_FLAGS overrides the -march.
+  set(VLA_RVV_FLAGS "-march=rv64gcv_zba_zbb_zbs_zfh_zvfh_zvfbfwma_zvl256b" CACHE STRING "riscv64 -march flags")
   set(VLA_RVV_MR "14" CACHE STRING "RVV fp32 GEMM register tile rows (1-14); 14 measured fastest on the K3 X100")
   separate_arguments(VLA_RVV_FLAG_LIST NATIVE_COMMAND "${VLA_RVV_FLAGS}")
   target_compile_options(vla_flags INTERFACE ${VLA_RVV_FLAG_LIST})
