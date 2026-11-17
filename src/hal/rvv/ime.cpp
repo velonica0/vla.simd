@@ -18,7 +18,11 @@
 // per call into [rows/(8*MT)][K8][MT][8][8]. Accumulation is fp32. Rounding to
 // fp16 (11-bit significand, range 65504) makes this a lossy path, so it is
 // opt-in (TCPU_IME=1), like the bf16 panels, and it needs the process started
-// on the A100 cores (see detect()). ime_attention, below, runs attention on the
+// on the A100 cores (see detect()). Values past the fp16 range never become
+// inf: a weight matrix that does not fit is refused at pack time (the layer
+// keeps its fp32/bf16 path), an activation row that does not fit is packed
+// scaled by a power of two and rescaled in fp32, and attention whose Q, K or V
+// does not fit falls back to the RVV kernel. ime_attention, below, runs attention on the
 // same micro-kernel (TCPU_IME_ATTN=0 keeps attention on the RVV kernel).
 
 #include "../arch.h"
@@ -33,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <vector>
@@ -204,6 +209,26 @@ bool detect() {
 
 inline _Float16 bf16_to_f16(uint16_t h) { return (_Float16)bf16_f32(h); }
 
+constexpr float F16_MAX = 65504.0f;
+
+// max |x[i]| with full-length vector ops (NaN is ignored, as vfmax does).
+float abs_max(const float* x, size_t n) {
+    const size_t vlmax = __riscv_vsetvlmax_e32m4();
+    vfloat32m4_t acc = __riscv_vfmv_v_f_f32m4(0.0f, vlmax);
+    for (size_t i = 0; i < n;) {
+        const size_t vl = __riscv_vsetvl_e32m4(n - i);
+        acc = __riscv_vfmax_vv_f32m4_tu(acc, acc, __riscv_vfabs_v_f32m4(__riscv_vle32_v_f32m4(x + i, vl), vl), vl);
+        i += vl;
+    }
+    return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m4_f32m1(acc, __riscv_vfmv_s_f_f32m1(0.0f, 1), vlmax));
+}
+
+// True when every |x[i]| <= F16_MAX (NaN passes: it stays NaN either way).
+bool fits_f16(size_t n, const float* x) {
+    for (size_t i=0; i<n; i++) if (std::fabs(x[i]) > F16_MAX) return false;
+    return true;
+}
+
 template <class Get>
 void pack_w(uint16_t* Wh, int N, int K, Get get) {
     const int K8 = (K+7)/8;
@@ -231,12 +256,17 @@ bool ime_available() {
 
 size_t ime_packed_size(int N, int K) { return (size_t)(N/16)*((K+7)/8)*128; }
 
-void pack_weights_ime(const float* W, uint16_t* Wh, int N, int K) {
+bool pack_weights_ime(const float* W, uint16_t* Wh, int N, int K) {
+    if (!fits_f16((size_t)N*K, W)) return false;
     pack_w(Wh, N, K, [W](size_t i) { return (_Float16)W[i]; });
+    return true;
 }
 
-void pack_weights_ime_bf16(const uint16_t* Wb16, uint16_t* Wh, int N, int K) {
+bool pack_weights_ime_bf16(const uint16_t* Wb16, uint16_t* Wh, int N, int K) {
+    for (size_t i=0, n=(size_t)N*K; i<n; i++)
+        if (std::fabs(bf16_f32(Wb16[i])) > F16_MAX) return false;
     pack_w(Wh, N, K, [Wb16](size_t i) { return bf16_to_f16(Wb16[i]); });
+    return true;
 }
 
 void dense_linear_ime(float* out, const float* x, const uint16_t* Wh, const float* bias,
@@ -246,10 +276,16 @@ void dense_linear_ime(float* out, const float* x, const uint16_t* Wh, const floa
 
     // Activations -> fp16 tiles [MB][K8][MT][8][8], zero rows/columns as padding.
     // thread_local: the view fan-out runs several threads through one Linear.
+    // A row whose largest |x| exceeds the fp16 range is packed as x * 2^-e and
+    // its output rescaled by rs[row] = 2^e in fp32 (exact powers of two; other
+    // rows keep rs = 1, so their results are unchanged).
     static thread_local std::vector<_Float16> xp_buf;
+    static thread_local std::vector<float> rs_buf;
     const size_t nx = (size_t)MB*K8*MT*64;
     if (xp_buf.size() < nx) xp_buf.resize(nx);
+    if (rs_buf.size() < (size_t)seq) rs_buf.resize(seq);
     _Float16* xp = xp_buf.data();
+    float* rs = rs_buf.data();
 #if defined(_OPENMP)
     #pragma omp parallel for schedule(static) collapse(2)
 #endif
@@ -264,15 +300,24 @@ void dense_linear_ime(float* out, const float* x, const uint16_t* Wh, const floa
                     continue;
                 }
                 const float* xr = x + (size_t)row*K;
+                const float amax = abs_max(xr, (size_t)K);
+                float s = 1.0f;
+                rs[row] = 1.0f;
+                if (amax > F16_MAX && amax <= std::numeric_limits<float>::max()) {
+                    int e;
+                    std::frexp(amax, &e);            // amax < 2^e
+                    s = std::ldexp(1.0f, 15 - e);    // amax*s < 2^15
+                    rs[row] = std::ldexp(1.0f, e - 15);
+                }
                 for (int k8=0; k8<K8; k8++) {
                     _Float16* dk = d + (size_t)k8*MT*64;
                     const int k0 = k8*8;
                     if (k0 + 8 <= K) {
-                        const vfloat32m1_t v = __riscv_vle32_v_f32m1(xr + k0, 8);
+                        const vfloat32m1_t v = __riscv_vfmul_vf_f32m1(__riscv_vle32_v_f32m1(xr + k0, 8), s, 8);
                         __riscv_vse16_v_f16mf2(dk, __riscv_vfncvt_f_f_w_f16mf2(v, 8), 8);
                     } else {
                         for (int c=0; c<8; c++)
-                            dk[c] = k0 + c < K ? (_Float16)xr[k0 + c] : (_Float16)0.0f;
+                            dk[c] = k0 + c < K ? (_Float16)(xr[k0 + c]*s) : (_Float16)0.0f;
                     }
                 }
             }
@@ -298,10 +343,11 @@ void dense_linear_ime(float* out, const float* x, const uint16_t* Wh, const floa
                     if (row >= seq) break;
                     float* o = out + (size_t)row*N + nb*16;
                     const float* ct = c + (t*2)*64 + r*8;
-                    __riscv_vse32_v_f32m1(o, __riscv_vfadd_vv_f32m1(
-                        __riscv_vle32_v_f32m1(ct, 8), b0, 8), 8);
-                    __riscv_vse32_v_f32m1(o + 8, __riscv_vfadd_vv_f32m1(
-                        __riscv_vle32_v_f32m1(ct + 64, 8), b1, 8), 8);
+                    const float sr = rs[row];        // c*1 + b == c + b exactly
+                    __riscv_vse32_v_f32m1(o, __riscv_vfmadd_vf_f32m1(
+                        __riscv_vle32_v_f32m1(ct, 8), sr, b0, 8), 8);
+                    __riscv_vse32_v_f32m1(o + 8, __riscv_vfmadd_vf_f32m1(
+                        __riscv_vle32_v_f32m1(ct + 64, 8), sr, b1, 8), 8);
                 }
         }
     }
@@ -392,11 +438,16 @@ bool ime_attention(float* out, const float* Q, const float* K, const float* V,
     // prefill layer, so this is computed once per call, not per row.
     if (mask && vm_buf.size() < ldkv) vm_buf.resize(ldkv);
     float* vm = mask ? vm_buf.data() : nullptr;
+    // fp16 range: the largest |K|, |V| and |scale*Q|, gathered while packing.
+    // Past 65504 the whole call returns false and the caller's fp32 kernel runs.
+    float kv_amax = 0.0f, q_amax = 0.0f;
 
 #if defined(_OPENMP)
     #pragma omp parallel
 #endif
   {
+    const size_t vlmax4 = __riscv_vsetvlmax_e32m4();
+    vfloat32m4_t vamax = __riscv_vfmv_v_f_f32m4(0.0f, vlmax4);
     // K and V^T are converted a whole row at a time (one full-length vector
     // convert into a small fp16 staging row) and then moved into the tiles
     // with 8-byte / 2-byte scalar copies: per-element scalar converts and
@@ -416,8 +467,9 @@ bool ime_attention(float* out, const float* Q, const float* K, const float* V,
                     const float* src = K + key*ldkv + (size_t)kv*head_dim;
                     for (size_t i = 0; i < (size_t)head_dim;) {
                         const size_t vl = __riscv_vsetvl_e32m4(head_dim - i);
-                        __riscv_vse16_v_f16m2(row + i, __riscv_vfncvt_f_f_w_f16m2(
-                            __riscv_vle32_v_f32m4(src + i, vl), vl), vl);
+                        const vfloat32m4_t v = __riscv_vle32_v_f32m4(src + i, vl);
+                        vamax = __riscv_vfmax_vv_f32m4_tu(vamax, vamax, __riscv_vfabs_v_f32m4(v, vl), vl);
+                        __riscv_vse16_v_f16m2(row + i, __riscv_vfncvt_f_f_w_f16m2(v, vl), vl);
                         i += vl;
                     }
                 } else {
@@ -440,8 +492,9 @@ bool ime_attention(float* out, const float* Q, const float* K, const float* V,
                     const float* src = V + key*ldkv + (size_t)kv*head_dim;
                     for (size_t i = 0; i < (size_t)head_dim;) {
                         const size_t vl = __riscv_vsetvl_e32m4(head_dim - i);
-                        __riscv_vse16_v_f16m2(rows[c] + i, __riscv_vfncvt_f_f_w_f16m2(
-                            __riscv_vle32_v_f32m4(src + i, vl), vl), vl);
+                        const vfloat32m4_t v = __riscv_vle32_v_f32m4(src + i, vl);
+                        vamax = __riscv_vfmax_vv_f32m4_tu(vamax, vamax, __riscv_vfabs_v_f32m4(v, vl), vl);
+                        __riscv_vse16_v_f16m2(rows[c] + i, __riscv_vfncvt_f_f_w_f16m2(v, vl), vl);
                         i += vl;
                     }
                 } else {
@@ -493,9 +546,25 @@ bool ime_attention(float* out, const float* Q, const float* K, const float* V,
                 }
             }
     }
+    {
+        const size_t ldq = (size_t)n_q*head_dim;
+        float qa = 0.0f;
+#if defined(_OPENMP)
+        #pragma omp for schedule(static) nowait
+#endif
+        for (int t=0; t<seq_q; t++) qa = std::max(qa, abs_max(Q + (size_t)t*ldq, ldq));
+        const float ka = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m4_f32m1(
+            vamax, __riscv_vfmv_s_f_f32m1(0.0f, 1), vlmax4));
+#if defined(_OPENMP)
+        #pragma omp critical(tcpu_ime_amax)
+#endif
+        { kv_amax = std::max(kv_amax, ka); q_amax = std::max(q_amax, qa); }
+    }
 #if defined(_OPENMP)
     #pragma omp barrier
 #endif
+    // Same value in every thread after the barrier, so all skip the loop together.
+    const bool fits = kv_amax <= F16_MAX && q_amax*std::fabs(scale) <= F16_MAX;
 
     // Flash-style: keys in chunks of KC so the chunk's scores, P and the output
     // accumulators stay in L1 (a 1024-key score block is 128 KB; streaming it
@@ -508,6 +577,7 @@ bool ime_attention(float* out, const float* Q, const float* K, const float* V,
     std::vector<float> sp(KC8*SLAB), oacc(NBD*2*SLAB);
     alignas(64) float acc[64*MT], rowv[64*MT], alphav[2*64*MT], c[MT*2*64];
     float mrow[8*MT], lrow[8*MT], alpha[8*MT];
+    if (fits) {
 #if defined(_OPENMP)
     #pragma omp for schedule(dynamic, 1) collapse(2)
 #endif
@@ -625,8 +695,9 @@ bool ime_attention(float* out, const float* Q, const float* K, const float* V,
                     }
             }
         }
+    }
   }
-    return true;
+    return kv_amax <= F16_MAX && q_amax*std::fabs(scale) <= F16_MAX;
 }
 
 } // namespace tcpu

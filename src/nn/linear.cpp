@@ -39,12 +39,16 @@ void Linear::init(const float* W_, const float* bias_, int N_, int K_, Role role
     if (role == Role::Generic || (TCPU_HAL_APPLE && accel_on())) return;
 
     // IME2 fp16 tiles on the K3's A100 cores (TCPU_IME=1); W stays as the raw
-    // fallback the int8 packer can read.
+    // fallback the int8 packer can read. Weights past the fp16 range keep the
+    // fp32 paths below.
     if (N%16 == 0 && ime_available()) {
         packed_ime.resize(ime_packed_size(N, K));
-        pack_weights_ime(W, packed_ime.data(), N, K);
-        Wh = packed_ime.data();
-        return;
+        if (pack_weights_ime(W, packed_ime.data(), N, K)) {
+            Wh = packed_ime.data();
+            return;
+        }
+        packed_ime.clear();
+        packed_ime.shrink_to_fit();
     }
 
     // Pack once for the packed-panel kernel (TCPU_PACKED=0 keeps the raw path;

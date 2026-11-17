@@ -27,7 +27,15 @@ void Linear::init_bf16(const uint16_t* Wb16, const float* bias_, int N_, int K_,
     packed_ime.clear();
 #if TCPU_HAL_RVV
     // IME2 fp16 tiles straight from the bf16 blob (TCPU_IME=1, A100 cores).
+    // A weight past the fp16 range keeps the bf16 paths below.
     if (role_ != Role::Generic && N_%16 == 0 && ime_available()) {
+        packed_ime.resize(ime_packed_size(N_, K_));
+        if (!pack_weights_ime_bf16(Wb16, packed_ime.data(), N_, K_)) {
+            packed_ime.clear();
+            packed_ime.shrink_to_fit();
+        }
+    }
+    if (!packed_ime.empty()) {
         W    = nullptr;
         bias = bias_;
         N    = N_;
@@ -39,8 +47,6 @@ void Linear::init_bf16(const uint16_t* Wb16, const float* bias_, int N_, int K_,
         packed.clear();
         packed_bf16.clear();
         deq.clear();
-        packed_ime.resize(ime_packed_size(N_, K_));
-        pack_weights_ime_bf16(Wb16, packed_ime.data(), N_, K_);
         Wh = packed_ime.data();
         return;
     }

@@ -160,7 +160,7 @@ static void test_linear() {
         if (ime_available()) {
             std::vector<uint16_t> Wh(ime_packed_size(N, K));
             std::vector<float> yh((size_t)seq*N);
-            pack_weights_ime(W.data(), Wh.data(), N, K);
+            CHECK(pack_weights_ime(W.data(), Wh.data(), N, K), "pack_weights_ime refused fp16-range weights");
             dense_linear_ime(yh.data(), x.data(), Wh.data(), b.data(), seq, N, K);
             expect_close("dense_linear_ime", yh, ref, mag, 2e-3);
         }
@@ -310,6 +310,70 @@ static void test_attention() {
     }
 }
 
+// Values past fp16's 65504 must never reach the IME tiles as inf: weights are
+// refused at pack time (the layer keeps fp32), activation rows are scaled by a
+// power of two, and attention falls back to the fp32 kernel. The checks on
+// Linear and attention results run on every backend.
+static void test_fp16_range() {
+    const int seq = 13, N = 32, K = 40;
+    auto x = rv((size_t)seq*K), W = rv((size_t)N*K), b = rv(N);
+    for (int k=0; k<K; k++) x[k] *= 1e6f;            // whole row past fp16
+    x[3*K + 7] = 3e5f;                                // one outlier
+    for (int k=0; k<K; k++) x[5*K + k] *= 1e30f;      // far past it
+    x[8*K + 2] = 65504.f;                             // exactly the limit
+    std::vector<double> ref, mag;
+    naive_linear(ref, mag, x.data(), W.data(), b.data(), seq, N, K);
+    if (ime_available()) {
+        std::vector<uint16_t> Wh(ime_packed_size(N, K));
+        std::vector<float> y((size_t)seq*N);
+        CHECK(pack_weights_ime(W.data(), Wh.data(), N, K), "pack_weights_ime refused fp16-range weights");
+        dense_linear_ime(y.data(), x.data(), Wh.data(), b.data(), seq, N, K);
+        expect_close("dense_linear_ime large activations", y, ref, mag, 2e-3);
+    }
+    // A weight past fp16: IME refuses it and Linear stays fp32 (error ~1e-7).
+    W[5*K + 11] = 1e5f;
+    naive_linear(ref, mag, x.data(), W.data(), b.data(), seq, N, K);
+    if (ime_available()) {
+        std::vector<uint16_t> Wh(ime_packed_size(N, K));
+        CHECK(!pack_weights_ime(W.data(), Wh.data(), N, K), "pack_weights_ime accepted a 1e5 weight");
+    }
+    {
+        nn::Linear linear;
+        linear.init(W.data(), b.data(), N, K, nn::Linear::Role::Gemm);
+        std::vector<float> y((size_t)seq*N);
+        linear.forward(y.data(), x.data(), seq);
+        expect_close("Linear with a weight past fp16", y, ref, mag, 1e-5);
+    }
+
+    // Attention with one large value in Q, K or V.
+    const int sq = 50, sk = 113, nq = 8, nkv = 2, hd = 64;
+    const float scale = 1.0f/std::sqrt((float)hd);
+    for (int which=0; which<4; which++) {
+        auto Q = rv((size_t)sq*nq*hd), Kt = rv((size_t)sk*nkv*hd), V = rv((size_t)sk*nkv*hd);
+        double vmag = 1.0, tol = 2e-6;
+        if (which == 0) Q[(size_t)(7*nq + 3)*hd + 5] = 1e6f;       // scale*Q = 1.25e5
+        if (which == 1) Kt[(size_t)(40*nkv + 1)*hd + 9] = 1e5f;
+        if (which == 2) { V[(size_t)(90*nkv + 0)*hd + 33] = 1e5f; vmag = 1e5; }
+        // Scores of ~1e4 carry fp32 rounding of ~1e-3 into the weights.
+        if (which < 2) tol = 5e-3;
+        // which == 3: everything in range; IME (when on) must accept it.
+        if (ime_attention_enabled()) {
+            std::vector<float> o((size_t)sq*nq*hd);
+            const bool took = ime_attention(o.data(), Q.data(), Kt.data(), V.data(),
+                                            sq, sk, nq, nkv, hd, scale, nullptr);
+            CHECK(took == (which == 3), "ime_attention %s case %d", took ? "accepted" : "refused", which);
+            if (which == 3) tol = 3e-3;
+        }
+        std::vector<float> got((size_t)sq*nq*hd), zero((size_t)sq*sk, 0.f);
+        gqa_attention_masked(got.data(), Q.data(), Kt.data(), V.data(), sq, sk, nq, nkv, hd, scale, zero.data());
+        std::vector<double> aref, amag(got.size(), vmag);
+        naive_attention(aref, Q.data(), Kt.data(), V.data(), nullptr, sq, sk, nq, nkv, hd, scale);
+        char what[64];
+        std::snprintf(what, sizeof what, "attention past fp16, case %d", which);
+        expect_close(what, got, aref, amag, tol);
+    }
+}
+
 static void test_eltwise() {
     const int n = 20011;
     auto x = rv(n, -30.f, 30.f);
@@ -444,6 +508,7 @@ int main() {
     CHECK(std::isinf(scaled_error({0}, {}, {1})), "comparison accepts shape mismatch");
     test_linear();
     test_attention();
+    test_fp16_range();
     test_eltwise();
     test_norms();
     test_conv();

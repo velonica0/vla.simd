@@ -82,8 +82,8 @@ void dense_linear_packed_bf16(float* out, const float* x, const uint16_t* Wp, co
 // No IME in this build: Linear never selects it.
 bool ime_available() { return false; }
 size_t ime_packed_size(int, int) { return 0; }
-void pack_weights_ime(const float*, uint16_t*, int, int) { std::abort(); }
-void pack_weights_ime_bf16(const uint16_t*, uint16_t*, int, int) { std::abort(); }
+bool pack_weights_ime(const float*, uint16_t*, int, int) { std::abort(); }
+bool pack_weights_ime_bf16(const uint16_t*, uint16_t*, int, int) { std::abort(); }
 void dense_linear_ime(float*, const float*, const uint16_t*, const float*, int, int, int) {
     std::abort();
 }

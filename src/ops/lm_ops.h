@@ -129,20 +129,23 @@ void dense_linear_packed_bf16(float* out, const float* x, const uint16_t* Wp, co
 // ime_available() is true only with TCPU_IME=1 when every thread already runs on
 // an A100 core (VLEN 1024) and vfwmadot executes.
 // Weights are packed once into fp16 8x8 tiles (ime_packed_size uint16 words, N
-// must be a multiple of 16); dense_linear_ime rounds x to fp16 and accumulates
-// in fp32. Elsewhere ime_available() is false and the other two must not be called.
+// must be a multiple of 16); the packers return false, writing nothing, when a
+// weight exceeds the fp16 range (65504). dense_linear_ime rounds x to fp16 and
+// accumulates in fp32; a row of x past the fp16 range is scaled by a power of
+// two and its output scaled back. Elsewhere ime_available() is false and the
+// other functions must not be called.
 bool ime_available();
 size_t ime_packed_size(int N, int K);
-void pack_weights_ime(const float* W, uint16_t* Wh, int N, int K);
-void pack_weights_ime_bf16(const uint16_t* Wb16, uint16_t* Wh, int N, int K);
+bool pack_weights_ime(const float* W, uint16_t* Wh, int N, int K);
+bool pack_weights_ime_bf16(const uint16_t* Wb16, uint16_t* Wh, int N, int K);
 void dense_linear_ime(float* out, const float* x, const uint16_t* Wh, const float* bias,
                       int seq, int N, int K);
 
 // IME2 attention: gqa_attention_masked's semantics with QK^T and PV on vfwmadot
 // (fp16 Q, K, V and softmax numerators; fp32 softmax and accumulation). Active
 // when ime_available() and TCPU_IME_ATTN is not 0; returns false, doing nothing,
-// when inactive or head_dim is not a multiple of 16 up to 256. The RVV gqa_attention_masked
-// tries it first.
+// when inactive, when head_dim is not a multiple of 16 up to 256, or when |Q*scale|,
+// |K| or |V| exceeds the fp16 range. The RVV gqa_attention_masked tries it first.
 bool ime_attention_enabled();
 bool ime_attention(float* out, const float* Q, const float* K, const float* V,
                    int seq_q, int seq_k, int n_q, int n_kv, int head_dim,
