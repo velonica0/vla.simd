@@ -2,7 +2,9 @@
 
 With the fastest configuration, FP32 median latency is 805.0 ms for TurboVLA and 5,207 ms for SmolVLA
 on the eight X100 cores, about 2× the Raspberry Pi 5 for both. The opt-in BF16 path
-(`TCPU_BF16_DEQ=0`) brings SmolVLA to 4,195 ms. Only these two models were run.
+(`TCPU_BF16_DEQ=0`) brings SmolVLA to 4,195 ms. Only these two models were run. In closed-loop
+LIBERO, a SmolVLA checkpoint on the K3 succeeds as often as vla.cpp on a GPU (16/20 FP32 and 18/20
+BF16, against 18/20); see [Task success](#task-success-libero).
 
 ## Test setup
 
@@ -99,6 +101,59 @@ Runtime settings tried at 8 threads, none kept (median ms; FP32 baseline 5,196 a
 Uses the RVV 14×16 tile (`VLA_RVV_MR=14`), measured fastest on the X100 with `tools/bench_tile`
 when the backend was written; the search was not repeated for this report.
 
+## Task success (LIBERO)
+
+The latency rows above use the SO-101 checkpoint, which has no simulator. To check that the K3
+produces usable actions, a LIBERO SmolVLA checkpoint ran closed loop in LIBERO-Object task 0 ("pick up
+the alphabet soup and place it in the basket"), against vla.cpp on a GPU as the reference.
+
+| Item | Value |
+| --- | --- |
+| vla.simd checkpoint | `HuggingFaceVLA/smolvla_libero`, converted with `tools/convert_hf_safetensors.py --pos-ids identity` |
+| vla.cpp checkpoint | `vrfai/smolvla-libero-gguf` (`smolvla-libero.gguf`), the one in vla.cpp's `docs/benchmark/libero.md` |
+| Client | vla.cpp `eval/client/run_sim_client_direct.py` at vla.cpp `71cdb09`, `--arch smolvla --task libero_object --task-id 0 --n-episodes 20 --n-action-steps 10 --seed 1` |
+| Simulator | LIBERO, 500-step limit; an episode that reaches it counts as a failure |
+| vla.simd serving | a ZeroMQ adapter that maps vla.cpp's request onto `SmolvlaEngine`; it rounds the client's float images to `uint8` |
+| Replay | 10 of each 50-action chunk, vla.cpp's `run_libero.sh` default for SmolVLA |
+| Noise | drawn fresh for every chunk, as in normal use |
+| Date | 2026-11-16, 17:00 to 19:10 UTC-8 |
+
+| Engine | Device | Successes | Inference per env step |
+| --- | --- | --- | --- |
+| vla.simd FP32 | K3, 8 × X100 | 16/20 (80%) | 1,133 ms |
+| vla.simd BF16 (`TCPU_BF16_DEQ=0`) | K3, 8 × X100 | 18/20 (90%) | 1,108 ms |
+| vla.simd FP32 | Intel Core i7-12700, 8 threads (AVX2) | 13/20 (65%) | 211 ms |
+| vla.cpp (CUDA, default flags) | NVIDIA GeForce RTX 4060 Ti | 18/20 (90%) | 14 ms |
+
+Episode *i* starts from LIBERO's *i*-th fixed initial state in every run. Failures fall on different
+episodes in each run, and none fails in all four. With 20 episodes per run the gaps are not
+significant: vla.cpp against the i7-12700, the largest, is p ≈ 0.13 (two-sided Fisher exact test),
+and vla.simd pooled (47/60) against vla.cpp is p ≈ 0.3. vla.cpp's 18/20 on this task matches its
+89.5% over all ten LIBERO-Object tasks.
+
+The two K3 runs shared the eight X100 cores, so their per-step inference times are about twice a
+single run's. "Inference per env step" is the client's average and includes the steps replayed
+without a query.
+
+Run-to-run variation is the main source of the spread. The FP32 runs on the K3 and on the i7-12700
+compute the same actions (below) and still scored 16 and 13. Each chunk draws new noise, so any
+change in the numerics leads to a different episode.
+
+Open-loop agreement, on four recorded LIBERO requests with the noise pinned in the request:
+
+| Comparison | Max abs. difference | Mean abs. difference | Cosine |
+| --- | --- | --- | --- |
+| K3 X100 FP32 vs i7-12700 FP32 (vla.simd) | 3.0e-6 | ≤ 3.4e-7 | 1.00000 |
+| K3 X100 BF16 vs i7-12700 FP32 (vla.simd) | 0.0058 | ≤ 7e-4 | 1.00000 |
+| vla.cpp CUDA vs vla.simd i7-12700 FP32 | 0.0044 | ≤ 4e-4 | 1.00000 |
+
+Actions lie in about ±1. The vla.cpp gap is the same size as vla.simd's BF16 gap; vla.cpp keeps the
+vision tower's weights in BF16 by default.
+
+Speed is where the devices differ. One SmolVLA chunk takes about 0.1 s on the RTX 4060 Ti and 4.1 to
+5.2 s on the K3's X100 cores. With 10 actions per chunk at LIBERO's 20 Hz, the K3 is about 8 to 10×
+too slow to keep up with the control loop. In simulation that only lengthens each episode.
+
 ## Notes
 
 - Only the eight X100 cores ran the benchmark. The board also brings up eight A100 cores (CPUs 8-15,
@@ -112,9 +167,12 @@ when the backend was written; the search was not repeated for this report.
 - INT8: `vla-simd-serve --int8` runs without error when no INT8 kernel is available and silently
   measures FP32, so the SmolVLA INT8 entry was disabled in the copy of `tools/bench_sweep.py` used
   here.
-- BF16 opt-in: rounding activations to BF16 changes the outputs. On a LIBERO SmolVLA checkpoint with
-  pinned noise, actions stayed within 0.006 of FP32 (cosine 1.00000), and 5 LIBERO-Object task-0
-  episodes succeeded as often as FP32 (2 of 5 each); that is too few episodes to measure accuracy.
+- BF16 opt-in: rounding activations to BF16 changes the outputs. On the LIBERO SmolVLA checkpoint
+  with pinned noise, actions stayed within 0.006 of FP32 (cosine 1.00000), and the BF16 run succeeded
+  in 18 of 20 LIBERO-Object task-0 episodes, against 16 for FP32 (see Task success).
+- Never load the X100 and the A100 cores at the same time. The board reset twice under that load
+  (temperature logger: load 16.8, cluster 0 at 80 to 81 °C, then nothing), including once when a single
+  A100 request arrived while the X100 cores were busy.
 - Temperatures during the sweep, from a 2 s logger: hottest cluster median 71 °C, peak 78 °C. The
   CPU clock was not sampled.
 - Search runs used 10 timed queries instead of 20, as on the Pi, to bound the total time.
