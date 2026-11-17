@@ -53,6 +53,15 @@ struct EncoderLayer {
     // Readout-only final layer: K/V still see every token, but only row ro of
     // x is updated (the only row the action head consumes).
     void forward_last_row(float* x, int ro, int total, const float* mask, Scratch& s) const;
+
+    // The block on an IME2 fp16 tile tensor (ops/lm_ops.h), unmasked, in place:
+    // x16 holds [total, d]. prepare_f16() builds the LayerNorm tiles and returns
+    // whether the layer can run this way (every Linear on IME tiles, tanh gelu,
+    // head_dim a multiple of 16); call it once after the layer is set up.
+    bool prepare_f16();
+    void forward_f16(uint16_t* x16, int total, Scratch& s, Prof* prof) const;
+
+    std::vector<float> ln_tiles;   // ln1 w, ln1 b, ln2 w, ln2 b, each [d/8][64]
 };
 
 } // namespace nn

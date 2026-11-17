@@ -87,6 +87,22 @@ bool pack_weights_ime_bf16(const uint16_t*, uint16_t*, int, int) { std::abort();
 void dense_linear_ime(float*, const float*, const uint16_t*, const float*, int, int, int) {
     std::abort();
 }
+bool ime_f16_enabled() { return false; }
+size_t ime_f16_size(int, int) { return 0; }
+void ime_f16_bias_tiles(float*, const float*, int) { std::abort(); }
+void ime_f16_pack(uint16_t*, const float*, int, int) { std::abort(); }
+bool ime_f16_unpack(float*, const uint16_t*, int, int) { std::abort(); }
+void ime_f16_linear(const ImeF16Job*, int, const uint16_t*, int, int) { std::abort(); }
+void ime_f16_layernorm(uint16_t*, const uint16_t*, const float*, const float*, int, int, float) { std::abort(); }
+void ime_f16_add(uint16_t*, const uint16_t*, int, int) { std::abort(); }
+void ime_f16_gelu_tanh(uint16_t*, int, int) { std::abort(); }
+void ime_f16_gelu_erf(uint16_t*, int, int) { std::abort(); }
+size_t ime_f16_rope_size(int, int) { return 0; }
+void ime_f16_rope_tables(float*, float*, const float*, const float*, int, int, int) { std::abort(); }
+void ime_f16_rope(uint16_t*, const float*, const float*, int, int, int) { std::abort(); }
+bool ime_f16_attention(uint16_t*, const uint16_t*, const uint16_t*, const uint16_t*, int, int, int, float) {
+    return false;
+}
 bool ime_attention_enabled() { return false; }
 bool ime_attention(float*, const float*, const float*, const float*, int, int, int, int, int,
                    float, const float*) {

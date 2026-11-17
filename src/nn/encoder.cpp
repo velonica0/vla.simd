@@ -76,6 +76,73 @@ void EncoderLayer::forward(float* x, int total, const float* mask, Scratch& s, P
     }
 }
 
+bool EncoderLayer::prepare_f16() {
+    ln_tiles.clear();
+    const bool ok = ime_f16_enabled() && gelu == Gelu::Tanh && d%16 == 0 && mlp%16 == 0 &&
+                    attn.head_dim%16 == 0 && attn.head_dim <= 256 && attn.heads*attn.head_dim == d &&
+                    attn.wq.f16_ok() && attn.wk.f16_ok() && attn.wv.f16_ok() && attn.wo.f16_ok() &&
+                    w1.f16_ok() && w2.f16_ok() && ln1_s && ln1_b && ln2_s && ln2_b;
+    if (!ok) return false;
+    const size_t n = (size_t)d*8;
+    ln_tiles.resize(4*n);
+    ime_f16_bias_tiles(ln_tiles.data(), ln1_s, d);
+    ime_f16_bias_tiles(ln_tiles.data() + n, ln1_b, d);
+    ime_f16_bias_tiles(ln_tiles.data() + 2*n, ln2_s, d);
+    ime_f16_bias_tiles(ln_tiles.data() + 3*n, ln2_b, d);
+    return true;
+}
+
+void EncoderLayer::forward_f16(uint16_t* x16, int total, Scratch& s, Prof* prof) const {
+    const size_t nd = ime_f16_size(total, d), nm = ime_f16_size(total, mlp), n = (size_t)d*8;
+    if (s.h16.size() < nd) s.h16.resize(nd);
+    if (s.q16.size() < nd) s.q16.resize(nd);
+    if (s.k16.size() < nd) s.k16.resize(nd);
+    if (s.v16.size() < nd) s.v16.resize(nd);
+    if (s.a16.size() < nd) s.a16.resize(nd);
+    if (s.ff16.size() < nm) s.ff16.resize(nm);
+    const float* lt = ln_tiles.data();
+
+    if (prof) prof->tic();
+    ime_f16_layernorm(s.h16.data(), x16, lt, lt + n, total, d, ln_eps);
+    if (prof) prof->toc(prof->ln);
+
+    if (prof) prof->tic();
+    const ImeF16Job qkv[3] = {attn.wq.f16_job(s.q16.data()), attn.wk.f16_job(s.k16.data()),
+                              attn.wv.f16_job(s.v16.data())};
+    ime_f16_linear(qkv, 3, s.h16.data(), total, d);
+    if (prof) prof->toc(prof->qkv);
+
+    if (prof) prof->tic();
+    ime_f16_attention(s.a16.data(), s.q16.data(), s.k16.data(), s.v16.data(), total,
+                      attn.heads, attn.head_dim, attn.scale);
+    if (prof) prof->toc(prof->attn);
+
+    if (prof) prof->tic();
+    const ImeF16Job proj = attn.wo.f16_job(s.h16.data());
+    ime_f16_linear(&proj, 1, s.a16.data(), total, d);
+    if (prof) prof->toc(prof->proj);
+
+    if (prof) prof->tic();
+    ime_f16_add(x16, s.h16.data(), total, d);
+    if (prof) prof->toc(prof->res);
+
+    if (prof) prof->tic();
+    ime_f16_layernorm(s.h16.data(), x16, lt + 2*n, lt + 3*n, total, d, ln_eps);
+    if (prof) prof->toc(prof->ln);
+
+    if (prof) prof->tic();
+    const ImeF16Job fc1 = w1.f16_job(s.ff16.data());
+    ime_f16_linear(&fc1, 1, s.h16.data(), total, d);
+    ime_f16_gelu_tanh(s.ff16.data(), total, mlp);
+    const ImeF16Job fc2 = w2.f16_job(s.h16.data());
+    ime_f16_linear(&fc2, 1, s.ff16.data(), total, mlp);
+    if (prof) prof->toc(prof->mlp);
+
+    if (prof) prof->tic();
+    ime_f16_add(x16, s.h16.data(), total, d);
+    if (prof) prof->toc(prof->res);
+}
+
 void EncoderLayer::forward_last_row(float* x, int ro, int total, const float* mask, Scratch& s) const {
     if (s.h.size()  < (size_t)total*d) s.h.resize ((size_t)total*d);
     if (s.ff.size() < (size_t)mlp    ) s.ff.resize((size_t)mlp);

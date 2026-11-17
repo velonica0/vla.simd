@@ -35,6 +35,7 @@ void Linear::init(const float* W_, const float* bias_, int N_, int K_, Role role
     packed_bf16.clear();
     packed_i8.clear();
     packed_ime.clear();
+    bias_ime.clear();
 
     if (role == Role::Generic || (TCPU_HAL_APPLE && accel_on())) return;
 
@@ -45,6 +46,7 @@ void Linear::init(const float* W_, const float* bias_, int N_, int K_, Role role
         packed_ime.resize(ime_packed_size(N, K));
         if (pack_weights_ime(W, packed_ime.data(), N, K)) {
             Wh = packed_ime.data();
+            init_ime_bias();
             return;
         }
         packed_ime.clear();
@@ -126,6 +128,8 @@ bool Linear::init_int8() {
     packed_bf16.shrink_to_fit();
     packed_ime.clear();
     packed_ime.shrink_to_fit();
+    bias_ime.clear();
+    bias_ime.shrink_to_fit();
     Wp = nullptr;
     Wb = nullptr;
     Wh = nullptr;
@@ -135,6 +139,13 @@ bool Linear::init_int8() {
 // Linear::init_bf16 / bf16_keeps_raw live in linear_bf16.cpp (linked last):
 // load-time-only code here shifted the hot nn objects and measurably slowed
 // the Cortex-A72 attention path.
+
+void Linear::init_ime_bias() {
+    bias_ime.clear();
+    if (!ime_f16_enabled()) return;
+    bias_ime.resize((size_t)N*8);
+    ime_f16_bias_tiles(bias_ime.data(), bias, N);
+}
 
 void Linear::forward(float* out, const float* x, int seq) const {
     if (Wh) {

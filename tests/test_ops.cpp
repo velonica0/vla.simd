@@ -5,6 +5,7 @@
 #include "ops/quant_ops.h"
 #include "nn/attention.h"
 #include "nn/conv.h"
+#include "nn/encoder.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -502,6 +503,149 @@ static void test_conv() {
     CHECK(gw <= 1e-5, "groupnorm error %.3e", gw);
 }
 
+// IME2 fp16 tile tensors: every op against its fp32 reference on the same
+// (fp16-representable) inputs. Runs only where the tile path is enabled.
+static void test_f16_tiles() {
+    if (!ime_f16_enabled()) return;
+    auto round16 = [](std::vector<float> x, int rows, int K) {
+        std::vector<uint16_t> t(ime_f16_size(rows, K));
+        ime_f16_pack(t.data(), x.data(), rows, K);
+        CHECK(ime_f16_unpack(x.data(), t.data(), rows, K), "ime_f16_unpack reported non-finite values");
+        return x;
+    };
+    for (int rows : {1, 31, 50, 256, 261}) {
+        const int K = 96, N = 160;
+        const auto x0 = rv((size_t)rows*K, -2.f, 2.f);
+        const auto x = round16(x0, rows, K);
+        for (size_t i = 0; i < x.size(); i++)
+            if (std::fabs(x[i] - x0[i]) > 5e-4f*std::fabs(x0[i]) + 1e-7f) {
+                CHECK(false, "ime_f16 pack/unpack moved %g to %g (rows %d)", x0[i], x[i], rows);
+                break;
+            }
+        std::vector<uint16_t> xt(ime_f16_size(rows, K)), yt(ime_f16_size(rows, N)), zt(xt.size());
+        ime_f16_pack(xt.data(), x.data(), rows, K);
+        std::vector<double> one((size_t)rows*K, 1.0);
+
+        // Linear, two jobs over one input.
+        const auto W = rv((size_t)N*K, -0.2f, 0.2f), W2 = rv((size_t)K*K, -0.2f, 0.2f), b = rv(N), b2 = rv(K);
+        std::vector<uint16_t> Wh(ime_packed_size(N, K)), Wh2(ime_packed_size(K, K));
+        CHECK(pack_weights_ime(W.data(), Wh.data(), N, K) && pack_weights_ime(W2.data(), Wh2.data(), K, K),
+              "pack_weights_ime refused fp16-range weights");
+        std::vector<float> bt((size_t)N*8), bt2((size_t)K*8), y((size_t)rows*N), z((size_t)rows*K);
+        ime_f16_bias_tiles(bt.data(), b.data(), N);
+        ime_f16_bias_tiles(bt2.data(), b2.data(), K);
+        const ImeF16Job jobs[2] = {{yt.data(), Wh.data(), bt.data(), N}, {zt.data(), Wh2.data(), bt2.data(), K}};
+        ime_f16_linear(jobs, 2, xt.data(), rows, K);
+        CHECK(ime_f16_unpack(y.data(), yt.data(), rows, N) && ime_f16_unpack(z.data(), zt.data(), rows, K),
+              "ime_f16_linear produced non-finite values");
+        std::vector<double> ref, mag;
+        naive_linear(ref, mag, x.data(), W.data(), b.data(), rows, N, K);
+        expect_close("ime_f16_linear", y, ref, mag, 2e-3);
+        naive_linear(ref, mag, x.data(), W2.data(), b2.data(), rows, K, K);
+        expect_close("ime_f16_linear job 2", z, ref, mag, 2e-3);
+
+        // LayerNorm.
+        const auto g = rv(K, 0.5f, 1.5f), be = rv(K);
+        std::vector<float> gt((size_t)K*8), bet((size_t)K*8), lnref((size_t)rows*K), got((size_t)rows*K);
+        ime_f16_bias_tiles(gt.data(), g.data(), K);
+        ime_f16_bias_tiles(bet.data(), be.data(), K);
+        ime_f16_layernorm(zt.data(), xt.data(), gt.data(), bet.data(), rows, K, 1e-6f);
+        CHECK(ime_f16_unpack(got.data(), zt.data(), rows, K), "ime_f16_layernorm produced non-finite values");
+        layernorm(lnref.data(), x.data(), g.data(), be.data(), rows, K, 1e-6f);
+        expect_close("ime_f16_layernorm", got, std::vector<double>(lnref.begin(), lnref.end()), one, 3e-3);
+
+        // GELU and the residual add.
+        auto gref = x;
+        gelu_tanh(gref.data(), rows*K);
+        std::vector<uint16_t> gtile = xt;
+        ime_f16_gelu_tanh(gtile.data(), rows, K);
+        CHECK(ime_f16_unpack(got.data(), gtile.data(), rows, K), "ime_f16_gelu_tanh produced non-finite values");
+        expect_close("ime_f16_gelu_tanh", got, std::vector<double>(gref.begin(), gref.end()), one, 2e-3);
+        ime_f16_add(gtile.data(), xt.data(), rows, K);
+        CHECK(ime_f16_unpack(got.data(), gtile.data(), rows, K), "ime_f16_add produced non-finite values");
+        for (size_t i = 0; i < gref.size(); i++) gref[i] += x[i];
+        expect_close("ime_f16_add", got, std::vector<double>(gref.begin(), gref.end()), one, 4e-3);
+
+        gref = x;
+        gelu_erf(gref.data(), rows*K);
+        gtile = xt;
+        ime_f16_gelu_erf(gtile.data(), rows, K);
+        CHECK(ime_f16_unpack(got.data(), gtile.data(), rows, K), "ime_f16_gelu_erf produced non-finite values");
+        expect_close("ime_f16_gelu_erf", got, std::vector<double>(gref.begin(), gref.end()), one, 2e-3);
+
+        // Rotary embedding on rows [first, rows), 3 heads of 32.
+        {
+            const int hd = 32, half = hd/2, first = rows > 5 ? 5 : 0, nr = rows - first;
+            std::vector<float> ang = rv((size_t)nr*hd, -3.f, 3.f), cs(ang.size()), sn(ang.size());
+            for (size_t i = 0; i < ang.size(); i++) { cs[i] = std::cos(ang[i]); sn[i] = std::sin(ang[i]); }
+            std::vector<float> ct(ime_f16_rope_size(rows, hd)), st(ct.size());
+            ime_f16_rope_tables(ct.data(), st.data(), cs.data(), sn.data(), rows, first, hd);
+            gtile = xt;
+            ime_f16_rope(gtile.data(), ct.data(), st.data(), rows, 3, hd);
+            CHECK(ime_f16_unpack(got.data(), gtile.data(), rows, K), "ime_f16_rope produced non-finite values");
+            std::vector<double> rref(x.begin(), x.end());
+            for (int r = first; r < rows; r++)
+                for (int h = 0; h < 3; h++)
+                    for (int d = 0; d < half; d++) {
+                        const size_t o = (size_t)r*K + h*hd + d, t = (size_t)(r - first)*hd + d;
+                        const double xa = x[o], xb = x[o + half];
+                        rref[o] = xa*cs[t] - xb*sn[t];
+                        rref[o + half] = xb*cs[t + half] + xa*sn[t + half];
+                    }
+            expect_close("ime_f16_rope", got, rref, one, 2e-3);
+        }
+
+        // Self-attention: 3 heads of 32 over the K = 96 columns.
+        const int heads = 3, hd = 32;
+        const auto kx = round16(rv((size_t)rows*K), rows, K), vx = round16(rv((size_t)rows*K), rows, K);
+        std::vector<uint16_t> kt(xt.size()), vt(xt.size());
+        ime_f16_pack(kt.data(), kx.data(), rows, K);
+        ime_f16_pack(vt.data(), vx.data(), rows, K);
+        const float scale = 1.0f/std::sqrt((float)hd);
+        CHECK(ime_f16_attention(zt.data(), xt.data(), kt.data(), vt.data(), rows, heads, hd, scale),
+              "ime_f16_attention refused rows %d", rows);
+        CHECK(ime_f16_unpack(got.data(), zt.data(), rows, K), "ime_f16_attention produced non-finite values");
+        naive_attention(ref, x.data(), kx.data(), vx.data(), nullptr, rows, rows, heads, heads, hd, scale);
+        expect_close("ime_f16_attention", got, ref, one, 3e-3);
+    }
+    {   // A value past fp16's range must be reported, not returned.
+        std::vector<float> x(64*32, 1.0f);
+        x[100] = 1e6f;
+        std::vector<uint16_t> t(ime_f16_size(64, 32));
+        ime_f16_pack(t.data(), x.data(), 64, 32);
+        CHECK(!ime_f16_unpack(x.data(), t.data(), 64, 32), "ime_f16_unpack accepted an overflowed value");
+    }
+    {   // A whole encoder layer: tile path against the fp32-tensor path.
+        const int d = 64, mlp = 128, total = 70;
+        const auto wq = rv(d*d, -0.2f, 0.2f), wk = rv(d*d, -0.2f, 0.2f), wv = rv(d*d, -0.2f, 0.2f),
+                   wo = rv(d*d, -0.2f, 0.2f), w1 = rv(mlp*d, -0.2f, 0.2f), w2 = rv(d*mlp, -0.2f, 0.2f);
+        const auto bq = rv(d), bk = rv(d), bv = rv(d), bo = rv(d), b1 = rv(mlp), b2 = rv(d);
+        const auto g1 = rv(d, 0.5f, 1.5f), e1 = rv(d), g2 = rv(d, 0.5f, 1.5f), e2 = rv(d);
+        nn::EncoderLayer layer;
+        using Role = nn::Linear::Role;
+        layer.attn.wq.init(wq.data(), bq.data(), d, d, Role::Gemm);
+        layer.attn.wk.init(wk.data(), bk.data(), d, d, Role::Gemm);
+        layer.attn.wv.init(wv.data(), bv.data(), d, d, Role::Gemm);
+        layer.attn.wo.init(wo.data(), bo.data(), d, d, Role::Gemm);
+        layer.attn.set_shape(4, 16);
+        layer.w1.init(w1.data(), b1.data(), mlp, d, Role::Mlp);
+        layer.w2.init(w2.data(), b2.data(), d, mlp, Role::Mlp);
+        layer.ln1_s = g1.data(); layer.ln1_b = e1.data(); layer.ln2_s = g2.data(); layer.ln2_b = e2.data();
+        layer.d = d; layer.mlp = mlp;
+        CHECK(layer.prepare_f16(), "EncoderLayer::prepare_f16 refused an IME layer");
+        auto x = rv((size_t)total*d);
+        std::vector<uint16_t> xt(ime_f16_size(total, d));
+        ime_f16_pack(xt.data(), x.data(), total, d);
+        nn::Scratch sc;
+        layer.forward_f16(xt.data(), total, sc, nullptr);
+        std::vector<float> got((size_t)total*d);
+        CHECK(ime_f16_unpack(got.data(), xt.data(), total, d), "forward_f16 produced non-finite values");
+        layer.forward(x.data(), total, nullptr, sc, nullptr);
+        std::vector<double> one(x.size(), 1.0);
+        expect_close("EncoderLayer::forward_f16", got, std::vector<double>(x.begin(), x.end()), one, 2e-2);
+    }
+}
+
 int main() {
     CHECK(std::isinf(scaled_error({NAN}, {0}, {1})), "comparison accepts NaN");
     CHECK(std::isinf(scaled_error({INFINITY}, {0}, {1})), "comparison accepts infinity");
@@ -509,6 +653,7 @@ int main() {
     test_linear();
     test_attention();
     test_fp16_range();
+    test_f16_tiles();
     test_eltwise();
     test_norms();
     test_conv();

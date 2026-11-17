@@ -5,6 +5,7 @@
  */
 
 #pragma once
+#include "../ops/lm_ops.h"
 #include <cstdint>
 #include <vector>
 
@@ -83,6 +84,12 @@ struct Linear {
 
     bool drop_raw();
 
+    // IME2 fp16 tile tensors (ops/lm_ops.h): true when this layer holds IME
+    // tiles and its shape fits a tile tensor on both sides. f16_job() is the
+    // layer as one ime_f16_linear job writing `out`.
+    bool f16_ok() const { return Wh && !bias_ime.empty() && K%16 == 0; }
+    ImeF16Job f16_job(uint16_t* out) const { return {out, Wh, bias_ime.data(), N}; }
+
     int N = 0, K = 0;
 
   private:
@@ -97,6 +104,8 @@ struct Linear {
     std::vector<float> packed;
     std::vector<uint16_t> packed_bf16;
     std::vector<uint16_t> packed_ime;   // fp16 bits, [N/16][K8][2][8][8]
+    std::vector<float> bias_ime;        // bias as [N/8][64] tiles (ime_f16_bias_tiles)
+    void init_ime_bias();
     std::vector<float> deq;             // owned fp32 dequant of a bf16 checkpoint
     std::vector<int32_t> packed_i8;   // int32-typed: see packed_i8_words
     std::vector<float> wscale;          // per-output-row weight scale

@@ -128,6 +128,10 @@ bool SiglipVision::load(const std::string& dir) {
     mm_proj.init_bf16(tw((size_t)cfg.mm_out*cfg.shuffled_dim()), nullptr,
                       cfg.mm_out, cfg.shuffled_dim(), Role::Gemm);
 
+    // IME2 fp16 tile tensors through the encoder layers when every layer can.
+    f16 = true;
+    for (nn::EncoderLayer& e : layers) f16 = e.prepare_f16() && f16;
+
     if (!nn::Linear::bf16_keeps_raw()) {
         wbf.clear();
         wbf.shrink_to_fit();
@@ -174,8 +178,25 @@ void SiglipVision::encode(const float* pixels, float* out, nn::Scratch& sc) cons
 
     // nullptr mask = full attention: SigLIP has no padding, and a 1024x1024 zero
     // array is 4 MB the dense kernel would otherwise stream once per head.
-    for (int L = 0; L < cfg.n_layers; L++)
-        layers[L].forward(h.data(), NP, nullptr, sc, vp.on ? &lp : nullptr);
+    // On IME2 the layers run on an fp16 tile tensor. A value past fp16's range
+    // shows up as inf/nan at the end, and the layers then rerun in fp32 from h.
+    bool done = false;
+    if (f16) {
+        vp.tic();
+        std::vector<uint16_t> x16(ime_f16_size(NP, H));
+        ime_f16_pack(x16.data(), h.data(), NP, H);
+        vp.toc(vp.pos);
+        for (int L = 0; L < cfg.n_layers; L++)
+            layers[L].forward_f16(x16.data(), NP, sc, vp.on ? &lp : nullptr);
+        vp.tic();
+        std::vector<float> hf((size_t)NP*H);
+        done = ime_f16_unpack(hf.data(), x16.data(), NP, H);
+        if (done) h.swap(hf);
+        vp.toc(vp.postln);
+    }
+    if (!done)
+        for (int L = 0; L < cfg.n_layers; L++)
+            layers[L].forward(h.data(), NP, nullptr, sc, vp.on ? &lp : nullptr);
 
     vp.tic();
     layernorm(h.data(), h.data(), post_ln_w, post_ln_b, NP, H, cfg.ln_eps);

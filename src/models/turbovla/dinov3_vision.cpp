@@ -140,6 +140,27 @@ bool Dinov3Vision::load(const std::string& dir, int img_size) {
                 s[quarter+i] = s[quarter+i + hd/2] = (float)std::sin(ax);
             }
         }
+
+    // IME2 fp16 tile tensors through the layers when every Linear is on IME tiles.
+    f16 = ime_f16_enabled() && H%16 == 0 && I%16 == 0 && hd%16 == 0 && hd <= 256;
+    for (const Dinov3Layer& l : layers)
+        f16 = f16 && l.wq.f16_ok() && l.wk.f16_ok() && l.wv.f16_ok() && l.wo.f16_ok() &&
+              l.up.f16_ok() && l.down.f16_ok();
+    if (f16) {
+        const size_t n = (size_t)H*8;
+        ln_tiles.resize(layers.size()*4*n);
+        for (size_t L = 0; L < layers.size(); L++) {
+            float* t = ln_tiles.data() + L*4*n;
+            ime_f16_bias_tiles(t, layers[L].ln1_w, H);
+            ime_f16_bias_tiles(t + n, layers[L].ln1_b, H);
+            ime_f16_bias_tiles(t + 2*n, layers[L].ln2_w, H);
+            ime_f16_bias_tiles(t + 3*n, layers[L].ln2_b, H);
+        }
+        rope_ct.resize(ime_f16_rope_size(n_tokens(), hd));
+        rope_st.resize(rope_ct.size());
+        ime_f16_rope_tables(rope_ct.data(), rope_st.data(), rope_cos.data(), rope_sin.data(),
+                            n_tokens(), cfg.prefix, hd);
+    }
     return true;
 }
 
@@ -178,6 +199,79 @@ struct VitProf {
     void toc(double& acc) { if (on) acc += nn::now_ms() - t0; }
 };
 } // namespace
+
+bool Dinov3Vision::encode_f16(int B) const {
+    const int H = cfg.hidden, I = cfg.inter, T = n_tokens();
+    const int TP = (T + 31)/32*32;                   // a view's rows in the tile tensors
+    const size_t vw = ime_f16_size(T, H), n = (size_t)H*8;
+    const float scale = 1.0f/std::sqrt((float)cfg.head_dim);
+    for (std::vector<uint16_t>* t : {&x16, &h16, &q16, &k16, &v16, &a16})
+        if (t->size() < (size_t)B*vw) t->resize((size_t)B*vw);
+    if (ff16.size() < (size_t)B*ime_f16_size(T, I)) ff16.resize((size_t)B*ime_f16_size(T, I));
+    for (int w = 0; w < B; w++)
+        ime_f16_pack(x16.data() + (size_t)w*vw, tok.data() + (size_t)w*T*H, T, H);
+
+    VitProf vp;
+    for (size_t L = 0; L < layers.size(); L++) {
+        const Dinov3Layer& l = layers[L];
+        const float* lt = ln_tiles.data() + L*4*n;
+        vp.tic();
+        ime_f16_layernorm(h16.data(), x16.data(), lt, lt + n, B*TP, H, cfg.ln_eps);
+        vp.toc(vp.ln);
+        vp.tic();
+        const ImeF16Job qkv[3] = {l.wq.f16_job(q16.data()), l.wk.f16_job(k16.data()), l.wv.f16_job(v16.data())};
+        ime_f16_linear(qkv, 3, h16.data(), B*TP, H);
+        vp.toc(vp.qkv);
+        vp.tic();
+        for (int w = 0; w < B; w++) {
+            ime_f16_rope(q16.data() + (size_t)w*vw, rope_ct.data(), rope_st.data(), T, cfg.n_heads, cfg.head_dim);
+            ime_f16_rope(k16.data() + (size_t)w*vw, rope_ct.data(), rope_st.data(), T, cfg.n_heads, cfg.head_dim);
+        }
+        vp.toc(vp.rope);
+        vp.tic();
+        for (int w = 0; w < B; w++) {
+            const size_t o = (size_t)w*vw;
+            if (!ime_f16_attention(a16.data() + o, q16.data() + o, k16.data() + o, v16.data() + o, T,
+                                   cfg.n_heads, cfg.head_dim, scale)) return false;
+        }
+        vp.toc(vp.attn);
+        vp.tic();
+        const ImeF16Job proj = l.wo.f16_job(h16.data());
+        ime_f16_linear(&proj, 1, a16.data(), B*TP, H);
+        vp.toc(vp.proj);
+        vp.tic();
+        ime_f16_add(x16.data(), h16.data(), B*TP, H);
+        vp.toc(vp.res);
+
+        vp.tic();
+        ime_f16_layernorm(h16.data(), x16.data(), lt + 2*n, lt + 3*n, B*TP, H, cfg.ln_eps);
+        vp.toc(vp.ln);
+        vp.tic();
+        const ImeF16Job up = l.up.f16_job(ff16.data());
+        ime_f16_linear(&up, 1, h16.data(), B*TP, H);
+        vp.toc(vp.mlp);
+        vp.tic();
+        ime_f16_gelu_erf(ff16.data(), B*TP, I);
+        vp.toc(vp.gelu);
+        vp.tic();
+        const ImeF16Job down = l.down.f16_job(h16.data());
+        ime_f16_linear(&down, 1, ff16.data(), B*TP, I);
+        vp.toc(vp.mlp);
+        vp.tic();
+        ime_f16_add(x16.data(), h16.data(), B*TP, H);
+        vp.toc(vp.res);
+    }
+    // h is free scratch here; tok is replaced only when every value is finite.
+    bool finite = true;
+    for (int w = 0; w < B; w++)
+        finite = ime_f16_unpack(h.data() + (size_t)w*T*H, x16.data() + (size_t)w*vw, T, H) && finite;
+    if (finite) std::memcpy(tok.data(), h.data(), (size_t)B*T*H*sizeof(float));
+    if (vp.on)
+        std::fprintf(stderr, "  [dinov3 f16] ln %5.1f  qkv %6.1f  rope %5.1f  attn %6.1f  proj %6.1f"
+                     "  mlp %6.1f  gelu %5.1f  res %5.1f%s\n", vp.ln, vp.qkv, vp.rope, vp.attn, vp.proj,
+                     vp.mlp, vp.gelu, vp.res, finite ? "" : " | not finite, rerunning in fp32");
+    return finite;
+}
 
 void Dinov3Vision::encode(const float* pixels, int n_views, float* out) const {
     const int H = cfg.hidden, I = cfg.inter, NP = n_patches(), T = n_tokens();
@@ -221,7 +315,8 @@ void Dinov3Vision::encode(const float* pixels, int n_views, float* out) const {
     vp.toc(vp.stem);
 
     const float scale = 1.0f/std::sqrt((float)cfg.head_dim);
-    for (int L = 0; L < cfg.n_layers; L++) {
+    const bool done = f16 && encode_f16(B);
+    for (int L = 0; !done && L < cfg.n_layers; L++) {
         const Dinov3Layer& l = layers[(size_t)L];
 
         vp.tic();

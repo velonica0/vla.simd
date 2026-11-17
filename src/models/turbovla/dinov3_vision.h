@@ -65,6 +65,15 @@ struct Dinov3Vision {
 
   private:
     mutable std::vector<float> tok, patches, pemb, h, q, k, v, att, ff;
+
+    // IME2 fp16 tile tensors (ops/lm_ops.h): the layers on them, every view
+    // padded to whole 32-row blocks. false when a layer cannot run that way or
+    // a value passed fp16's range (the fp32 loop then runs).
+    bool encode_f16(int n_views) const;
+    bool f16 = false;
+    std::vector<float> ln_tiles;             // per layer: ln1 w, b, ln2 w, b as [hidden/8][64]
+    std::vector<float> rope_ct, rope_st;     // ime_f16_rope_tables
+    mutable std::vector<uint16_t> x16, h16, q16, k16, v16, a16, ff16;
 };
 
 } // namespace tcpu

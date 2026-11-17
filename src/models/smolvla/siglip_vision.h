@@ -44,6 +44,7 @@ struct SiglipVision {
     nn::Linear patch_lin;             // patch embed as a GEMM over extracted patches
     const float* pos_emb = nullptr;
     std::vector<nn::EncoderLayer> layers;
+    bool f16 = false;   // layers run on IME2 fp16 tile tensors
     const float *post_ln_w = nullptr, *post_ln_b = nullptr;
     nn::Linear mm_proj;               // [mm_out, shuffled_dim], no bias
     mutable nn::Scratch scratch;      // reused across layers and views

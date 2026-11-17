@@ -151,6 +151,46 @@ bool ime_attention(float* out, const float* Q, const float* K, const float* V,
                    int seq_q, int seq_k, int n_q, int n_kv, int head_dim,
                    float scale, const float* mask);
 
+// fp16 tile tensors on IME2 (src/hal/rvv/ime.cpp). A tile tensor holds [rows][K],
+// K a multiple of 16, as fp16 in vfwmadot's activation layout
+// [ceil(rows/32)][K/8][4][8][8] (ime_f16_size uint16 words), which is also the
+// layout of the GEMM's output tiles: a Linear reads and writes it with no pack
+// and no epilogue, and a whole encoder block stays in fp16 (sums are carried in
+// fp32). ime_f16_enabled() needs ime_available() and TCPU_IME_F16 not 0. With
+// TCPU_IME_TCM=1 the GEMM's row chunks and attention's K and V^T are held in
+// the A100 cores' TCM (384 KB of SRAM per core behind /dev/tcm); threads that
+// use it pin themselves to a core.
+// ime_f16_bias_tiles: bias [N] (or nullptr for zeros) -> [N/8][64] fp32, the form
+// ime_f16_linear and ime_f16_layernorm (weight and bias) take.
+// ime_f16_unpack returns false when the tensor holds an inf or nan, i.e. a value
+// passed fp16's range somewhere upstream; the caller then reruns in fp32.
+// ime_f16_attention is unmasked self-attention over `rows` tokens. Several
+// sequences can share one tensor when each starts on a 32-row block: the
+// elementwise ops and ime_f16_linear then run over all of them at once, and the
+// attention and rotary calls take each sequence's part.
+struct ImeF16Job { uint16_t* out; const uint16_t* Wh; const float* bias_tiles; int N; };
+bool ime_f16_enabled();
+size_t ime_f16_size(int rows, int K);
+void ime_f16_bias_tiles(float* bt, const float* bias, int N);
+void ime_f16_pack(uint16_t* t, const float* x, int rows, int K);
+bool ime_f16_unpack(float* x, const uint16_t* t, int rows, int K);
+void ime_f16_linear(const ImeF16Job* jobs, int n_jobs, const uint16_t* x, int rows, int K);
+void ime_f16_layernorm(uint16_t* out, const uint16_t* x, const float* w_tiles, const float* b_tiles,
+                       int rows, int K, float eps);
+void ime_f16_add(uint16_t* x, const uint16_t* y, int rows, int K);
+void ime_f16_gelu_tanh(uint16_t* x, int rows, int K);
+void ime_f16_gelu_erf(uint16_t* x, int rows, int K);
+// Rotary embedding on x [rows][heads*head_dim] (head_dim a multiple of 16), per
+// head and pair (d, d + head_dim/2): a' = a*cos[d] - b*sin[d], b' = b*cos[d+half]
+// + a*sin[d+half]. The tables (ime_f16_rope_size floats each) are built once
+// from cos/sin [rows - first][head_dim]; the first `first` rows are not rotated.
+size_t ime_f16_rope_size(int rows, int head_dim);
+void ime_f16_rope_tables(float* ct, float* st, const float* cos_t, const float* sin_t,
+                         int rows, int first, int head_dim);
+void ime_f16_rope(uint16_t* x, const float* ct, const float* st, int rows, int heads, int head_dim);
+bool ime_f16_attention(uint16_t* out, const uint16_t* q, const uint16_t* k, const uint16_t* v,
+                       int rows, int heads, int head_dim, float scale);
+
 // Same GEMM, output stored TRANSPOSED: out_t[n*ldo + t] (in-register 8x8 transpose
 // epilogue, masked stores). Produces attention's K^T layout straight from the K
 // projection, skipping the separate transpose pass. Same accumulation order as

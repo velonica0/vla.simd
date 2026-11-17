@@ -19,6 +19,9 @@ struct Scratch {
     std::vector<float> h, q, k, v, att, ff, kt;
     std::vector<int8_t> quantized;
     std::vector<float> scales;
+    // fp16 tile tensors (EncoderLayer::forward_f16): normed x / projections, q, k, v,
+    // attention output, MLP hidden.
+    std::vector<uint16_t> h16, q16, k16, v16, a16, ff16;
 };
 
 // Per-op time buckets (the OCTO_PROFILE_TF breakdown). Layers run serially and

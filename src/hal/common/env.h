@@ -131,6 +131,15 @@ bool ime();
 // the IME2 one (default on; ignored without IME).
 bool ime_attn();
 
+// TCPU_IME_F16=0: with TCPU_IME=1, keep the encoders that can run on fp16 tile
+// tensors (ops/lm_ops.h) on fp32 tensors between the IME2 kernels (default on).
+bool ime_f16();
+
+// TCPU_IME_TCM=1: with TCPU_IME=1, hold the IME2 kernels' re-read operands in
+// the A100 cores' TCM (/dev/tcm). Default off: the TCM has no allocator, so two
+// processes using it at once corrupt each other, and its threads pin to cores.
+bool ime_tcm();
+
 // TCPU_GEMM_SCHED=static reverts the Pi packed GEMMs to static scheduling
 // (dynamic whole-panel is the measured ARM default).
 bool gemm_force_static();
