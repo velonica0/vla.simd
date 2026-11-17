@@ -30,6 +30,8 @@ Reproduce a device with `tools/bench_sweep.py` from a Release build of that comm
 report also covers the Windows on Arm build and its register-tile selection.
 
 The SpacemiT K3 (RISC-V, RVV backend) ran SmolVLA and TurboVLA only, on a later commit, so it is
-not in the table: see [spacemit-k3.md](spacemit-k3.md) (FP32 5,207 ms and 805.0 ms).
+not in the table: see [spacemit-k3.md](spacemit-k3.md) (FP32 5,207 ms and 805.0 ms on the X100
+cores; about 2.1 s and 346 ms with the opt-in IME2 path on the A100 cores). That report also has
+closed-loop LIBERO task success for both models.
 
 The audit and parity report is [intel-core-ultra-9-285k.md](intel-core-ultra-9-285k.md).
