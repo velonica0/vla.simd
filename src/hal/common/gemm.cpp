@@ -87,6 +87,11 @@ void pack_weights_ime_bf16(const uint16_t*, uint16_t*, int, int) { std::abort();
 void dense_linear_ime(float*, const float*, const uint16_t*, const float*, int, int, int) {
     std::abort();
 }
+bool ime_attention_enabled() { return false; }
+bool ime_attention(float*, const float*, const float*, const float*, int, int, int, int, int,
+                   float, const float*) {
+    return false;
+}
 #endif
 
 } // namespace tcpu

@@ -196,6 +196,11 @@ bool ime() {
     return v;
 }
 
+bool ime_attn() {
+    static const bool v = flag_on("TCPU_IME_ATTN", true);
+    return v;
+}
+
 bool gemm_force_static() {
     static const bool v = [] {
         const char* e = std::getenv("TCPU_GEMM_SCHED");

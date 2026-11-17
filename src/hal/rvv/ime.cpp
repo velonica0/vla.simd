@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// SpacemiT IME2 fp16 GEMM for the K3's A100 cores (VLEN 1024).
+// SpacemiT IME2 fp16 GEMM and attention for the K3's A100 cores (VLEN 1024).
 //
 // vfwmadot vd, vs1, vs2, fp16 (vtype e16/m1): vd, an 8x8 fp32 tile held row-major
 // in a register pair, accumulates vs1 * vs2^T, where vs1 is an 8x8 fp16 tile of
@@ -18,12 +18,14 @@
 // per call into [rows/(8*MT)][K8][MT][8][8]. Accumulation is fp32. Rounding to
 // fp16 (11-bit significand, range 65504) makes this a lossy path, so it is
 // opt-in (TCPU_IME=1), like the bf16 panels, and it needs the process started
-// on the A100 cores (see detect()).
+// on the A100 cores (see detect()). ime_attention, below, runs attention on the
+// same micro-kernel (TCPU_IME_ATTN=0 keeps attention on the RVV kernel).
 
 #include "../arch.h"
 #if TCPU_HAL_RVV && TCPU_RVV_IME
 
 #include "../common/env.h"
+#include "../simd.h"
 #include "../../ops/lm_ops.h"
 #include <riscv_vector.h>
 #include <csetjmp>
@@ -31,6 +33,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <limits>
 #include <vector>
 #if defined(_OPENMP)
 #include <omp.h>
@@ -48,8 +52,14 @@ constexpr int MT = TCPU_IME_MT;
 static_assert(MT == 4 || MT == 6, "the IME micro-kernel exists for 4 or 6 activation tiles");
 
 // MT activation tiles (8*MT rows) x 2 weight tiles (16 columns) over k8 steps.
-// a: [k8][MT][64] fp16, b: [k8][2][64] fp16, c: [MT][2][64] fp32 (overwritten).
-void ime_tile(float* c, const _Float16* a, const _Float16* b, size_t k8) {
+// a: [k8][MT][64] fp16, b: [k8][2][64] fp16. Output tile (t, h), 64 fp32, is
+// stored at c + (h ? c1off : 0) + t*cstep floats: ime_tile's default [MT][2][64]
+// for the GEMM, or [2][MT][64] (c1off = MT*64, cstep = 64), the layout the next
+// GEMM reads as activations, for attention scores.
+void ime_tile(float* c, const _Float16* a, const _Float16* b, size_t k8,
+              size_t c1off = 64, size_t cstep = 128) {
+    float* c1 = c + c1off;
+    const size_t st = cstep*sizeof(float);
     const size_t vl = 64;
     if constexpr (MT == 4) {
         __asm__ volatile(
@@ -75,16 +85,15 @@ void ime_tile(float* c, const _Float16* a, const _Float16* b, size_t k8) {
             "addi %[n], %[n], -1 \n\t"
             "bnez %[n], 1b \n\t"
             "vsetvli  zero, %[vl], e32, m2, ta, ma \n\t"
-            "vse32.v  v16, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v18, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v20, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v22, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v24, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v26, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v28, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v30, (%[c]) \n\t"
-            : [a] "+r"(a), [b] "+r"(b), [c] "+r"(c), [n] "+r"(k8)
-            : [vl] "r"(vl)
+            "vse32.v  v16, (%[c]) \n\t" "vse32.v  v18, (%[c1]) \n\t"
+            "add %[c], %[c], %[st] \n\t" "add %[c1], %[c1], %[st] \n\t"
+            "vse32.v  v20, (%[c]) \n\t" "vse32.v  v22, (%[c1]) \n\t"
+            "add %[c], %[c], %[st] \n\t" "add %[c1], %[c1], %[st] \n\t"
+            "vse32.v  v24, (%[c]) \n\t" "vse32.v  v26, (%[c1]) \n\t"
+            "add %[c], %[c], %[st] \n\t" "add %[c1], %[c1], %[st] \n\t"
+            "vse32.v  v28, (%[c]) \n\t" "vse32.v  v30, (%[c1]) \n\t"
+            : [a] "+r"(a), [b] "+r"(b), [c] "+r"(c), [c1] "+r"(c1), [n] "+r"(k8)
+            : [vl] "r"(vl), [st] "r"(st)
             : "cc", "memory", "v0", "v1", "v2", "v3", "v4", "v5", "v16", "v17", "v18", "v19", "v20",
               "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
     } else {
@@ -118,20 +127,19 @@ void ime_tile(float* c, const _Float16* a, const _Float16* b, size_t k8) {
             "addi %[n], %[n], -1 \n\t"
             "bnez %[n], 1b \n\t"
             "vsetvli  zero, %[vl], e32, m2, ta, ma \n\t"
-            "vse32.v  v8,  (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v10, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v12, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v14, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v16, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v18, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v20, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v22, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v24, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v26, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v28, (%[c]) \n\t" "addi %[c], %[c], 256 \n\t"
-            "vse32.v  v30, (%[c]) \n\t"
-            : [a] "+r"(a), [b] "+r"(b), [c] "+r"(c), [n] "+r"(k8)
-            : [vl] "r"(vl)
+            "vse32.v  v8, (%[c]) \n\t" "vse32.v  v10, (%[c1]) \n\t"
+            "add %[c], %[c], %[st] \n\t" "add %[c1], %[c1], %[st] \n\t"
+            "vse32.v  v12, (%[c]) \n\t" "vse32.v  v14, (%[c1]) \n\t"
+            "add %[c], %[c], %[st] \n\t" "add %[c1], %[c1], %[st] \n\t"
+            "vse32.v  v16, (%[c]) \n\t" "vse32.v  v18, (%[c1]) \n\t"
+            "add %[c], %[c], %[st] \n\t" "add %[c1], %[c1], %[st] \n\t"
+            "vse32.v  v20, (%[c]) \n\t" "vse32.v  v22, (%[c1]) \n\t"
+            "add %[c], %[c], %[st] \n\t" "add %[c1], %[c1], %[st] \n\t"
+            "vse32.v  v24, (%[c]) \n\t" "vse32.v  v26, (%[c1]) \n\t"
+            "add %[c], %[c], %[st] \n\t" "add %[c1], %[c1], %[st] \n\t"
+            "vse32.v  v28, (%[c]) \n\t" "vse32.v  v30, (%[c1]) \n\t"
+            : [a] "+r"(a), [b] "+r"(b), [c] "+r"(c), [c1] "+r"(c1), [n] "+r"(k8)
+            : [vl] "r"(vl), [st] "r"(st)
             : "cc", "memory", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
               "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24",
               "v25", "v26", "v27", "v28", "v29", "v30", "v31");
@@ -300,6 +308,328 @@ void dense_linear_ime(float* out, const float* x, const uint16_t* Wh, const floa
   }
 }
 
+// ---- attention ----
+//
+// Per (query head, block of 8*MT queries): S = (scale*Q) K^T and O = P V both run
+// on ime_tile, with an online (flash) softmax in fp32 between them over chunks
+// of KC keys. Q, K, V and the softmax numerators P (in [0, 1]) are rounded to
+// fp16; the row sums and the output accumulation are fp32.
+//
+// Everything between the two GEMMs stays in the activation layout of the second
+// one, [keys/8][MT][8 rows][8 keys]: QK^T stores its tiles there directly, the
+// softmax runs on whole 64*MT-float slabs (per-row max and sum are folded out of
+// elementwise slab accumulators), and P is converted to fp16 in order. On the
+// A100 a dependent chain of 8-lane vector operations costs ~32 cycles per 8
+// elements and a scalar fp16 convert ~7 cycles, while full-length FP32 vector
+// arithmetic runs at ~13 elements per cycle, so the kernel keeps to full-length
+// operations and to chunks small enough for L1 (a 1024-key fp32 score block is
+// 128 KB; streaming it through L2 tripled the softmax's cost per element).
+// ViT shape (1024 x 1024, 12 heads, 8 threads): 13 ms vs 64 ms for the RVV kernel.
+//
+// K is packed per kv head as the GEMM's weight operand [SKP/16][hd/8][2][64]
+// (keys padded to 16 with zeros), V transposed as [hd/16][SKP/8][2][64], so the
+// group's query heads share them. The additive mask, with BLOCK -> -inf and the
+// padded keys at -inf, is packed once per query block in the score layout and
+// shared by every head. Masking and the all-blocked-row fallback match
+// hal/rvv/attn.cpp.
+
+// exp(x) for the softmax numerators: x <= 0 (score minus row max) and the
+// result is rounded to fp16 next, so a degree-4 2^f (relative error 6.4e-6
+// on [-17.5, 0], 40x under fp16's half-ulp) replaces exp_ps's Cephes
+// polynomial, at about half the A100 vector instructions. x is clamped at
+// -17.5: exp(-17.5) = 2.5e-8 rounds to an fp16 0, so blocked (-inf) and padded
+// keys still get exactly zero weight; their 2.5e-8 in the fp32 sum is
+// negligible. c1..c4 are the polynomial's coefficients, broadcast by the caller.
+static inline vfloat32m4_t exp_softmax(vfloat32m4_t x, vfloat32m4_t c1, vfloat32m4_t c2,
+                                       vfloat32m4_t c3, vfloat32m4_t c4, size_t vl) {
+    const vfloat32m4_t t = __riscv_vfmul_vf_f32m4(__riscv_vfmax_vf_f32m4(x, -17.5f, vl),
+                                                  1.44269504088896341f, vl);
+    const vint32m4_t n = __riscv_vfcvt_x_f_v_i32m4(t, vl);   // round to nearest
+    const vfloat32m4_t f = __riscv_vfsub_vv_f32m4(t, __riscv_vfcvt_f_x_v_f32m4(n, vl), vl);
+    vfloat32m4_t y = __riscv_vfmadd_vv_f32m4(c4, f, c3, vl);
+    y = __riscv_vfmadd_vv_f32m4(y, f, c2, vl);
+    y = __riscv_vfmadd_vv_f32m4(y, f, c1, vl);
+    y = __riscv_vfmacc_vv_f32m4(__riscv_vfmv_v_f_f32m4(1.0f, vl), y, f, vl);   // 1 + f*y
+    const vfloat32m4_t pow2n = __riscv_vreinterpret_v_i32m4_f32m4(
+        __riscv_vsll_vx_i32m4(__riscv_vadd_vx_i32m4(n, 127, vl), 23, vl));
+    return __riscv_vfmul_vv_f32m4(y, pow2n, vl);
+}
+
+bool ime_attention_enabled() {
+    static const bool v = ime_available() && hal::env::ime_attn();
+    return v;
+}
+
+bool ime_attention(float* out, const float* Q, const float* K, const float* V,
+                   int seq_q, int seq_k, int n_q, int n_kv, int head_dim,
+                   float scale, const float* mask) {
+    if (head_dim % 16 != 0 || head_dim > 256 || seq_q <= 0 || seq_k <= 0 || !ime_attention_enabled()) return false;
+    const int    group = n_q/n_kv;
+    const int    QB    = 8*MT;
+    const size_t SLAB  = (size_t)MT*64;                // one 8-key group of a block, fp32
+    const size_t SKP   = ((size_t)seq_k + 15)/16*16;   // keys padded to a weight tile
+    const size_t K8q   = (size_t)head_dim/8;           // QK reduction steps
+    const size_t K8p   = SKP/8;                        // key groups
+    const size_t NBD   = (size_t)head_dim/16;          // output tiles per row block
+    const size_t kp_n  = SKP/16*K8q*128;               // per kv head
+    const size_t vt_n  = NBD*K8p*128;                  // per kv head
+    const size_t ldkv  = (size_t)n_kv*head_dim;        // K/V row stride
+    const float  NINF  = -std::numeric_limits<float>::infinity();
+    const float  BLOCK = std::numeric_limits<float>::lowest();
+    const int    qblocks = (seq_q + QB - 1)/QB;
+    const bool   use_mp  = mask || SKP != (size_t)seq_k;
+
+    static thread_local std::vector<_Float16> kp_buf, vt_buf;
+    static thread_local std::vector<float> mp_buf, vm_buf;
+    if (kp_buf.size() < (size_t)n_kv*kp_n) kp_buf.resize((size_t)n_kv*kp_n);
+    if (vt_buf.size() < (size_t)n_kv*vt_n) vt_buf.resize((size_t)n_kv*vt_n);
+    if (use_mp && mp_buf.size() < (size_t)qblocks*K8p*SLAB) mp_buf.resize((size_t)qblocks*K8p*SLAB);
+    _Float16* kp = kp_buf.data();
+    _Float16* vt = vt_buf.data();
+    float*    mp = use_mp ? mp_buf.data() : nullptr;
+    // Mean of V per kv head, for rows whose every key is blocked (only a mask
+    // can block a row). SmolVLA's padded language tokens are such rows in every
+    // prefill layer, so this is computed once per call, not per row.
+    if (mask && vm_buf.size() < ldkv) vm_buf.resize(ldkv);
+    float* vm = mask ? vm_buf.data() : nullptr;
+
+#if defined(_OPENMP)
+    #pragma omp parallel
+#endif
+  {
+    // K and V^T are converted a whole row at a time (one full-length vector
+    // convert into a small fp16 staging row) and then moved into the tiles
+    // with 8-byte / 2-byte scalar copies: per-element scalar converts and
+    // 8-lane vector ops each cost tens of cycles on the A100.
+    //
+    // K tile (nb, k8) half h, row r = key nb*16+h*8+r, columns d = k8*8 .. +7.
+#if defined(_OPENMP)
+    #pragma omp for schedule(static) collapse(2)
+#endif
+    for (int kv=0; kv<n_kv; kv++)
+        for (size_t nb=0; nb<SKP/16; nb++) {
+            alignas(16) _Float16 row[256];
+            _Float16* tile = kp + kv*kp_n + nb*K8q*128;
+            for (int r=0; r<16; r++) {
+                const size_t key = nb*16 + r;
+                if (key < (size_t)seq_k) {
+                    const float* src = K + key*ldkv + (size_t)kv*head_dim;
+                    for (size_t i = 0; i < (size_t)head_dim;) {
+                        const size_t vl = __riscv_vsetvl_e32m4(head_dim - i);
+                        __riscv_vse16_v_f16m2(row + i, __riscv_vfncvt_f_f_w_f16m2(
+                            __riscv_vle32_v_f32m4(src + i, vl), vl), vl);
+                        i += vl;
+                    }
+                } else {
+                    std::memset(row, 0, head_dim*sizeof(_Float16));
+                }
+                for (size_t k8=0; k8<K8q; k8++) std::memcpy(tile + k8*128 + r*8, row + k8*8, 16);
+            }
+        }
+    // V^T tile (nb, k8) half h, row r = dim nb*16+h*8+r, columns key = k8*8 .. +7:
+    // stage the 8 keys' rows, then transpose with 2-byte moves.
+#if defined(_OPENMP)
+    #pragma omp for schedule(static) collapse(2)
+#endif
+    for (int kv=0; kv<n_kv; kv++)
+        for (size_t k8=0; k8<K8p; k8++) {
+            alignas(16) _Float16 rows[8][256];
+            for (int c=0; c<8; c++) {
+                const size_t key = k8*8 + c;
+                if (key < (size_t)seq_k) {
+                    const float* src = V + key*ldkv + (size_t)kv*head_dim;
+                    for (size_t i = 0; i < (size_t)head_dim;) {
+                        const size_t vl = __riscv_vsetvl_e32m4(head_dim - i);
+                        __riscv_vse16_v_f16m2(rows[c] + i, __riscv_vfncvt_f_f_w_f16m2(
+                            __riscv_vle32_v_f32m4(src + i, vl), vl), vl);
+                        i += vl;
+                    }
+                } else {
+                    std::memset(rows[c], 0, head_dim*sizeof(_Float16));
+                }
+            }
+            for (size_t nb=0; nb<NBD; nb++) {
+                _Float16* d = vt + kv*vt_n + (nb*K8p + k8)*128;
+                for (int r=0; r<16; r++, d += 8)
+                    for (int c=0; c<8; c++) d[c] = rows[c][nb*16 + r];
+            }
+        }
+    if (vm) {   // contiguous row sums, full-length vector ops; one thread
+#if defined(_OPENMP)
+        #pragma omp single nowait
+#endif
+        {
+            std::memset(vm, 0, ldkv*sizeof(float));
+            for (int t=0; t<seq_k; t++)
+                for (size_t i = 0; i < ldkv;) {
+                    const size_t vl = __riscv_vsetvl_e32m4(ldkv - i);
+                    __riscv_vse32_v_f32m4(vm + i, __riscv_vfadd_vv_f32m4(__riscv_vle32_v_f32m4(vm + i, vl),
+                        __riscv_vle32_v_f32m4(V + (size_t)t*ldkv + i, vl), vl), vl);
+                    i += vl;
+                }
+            for (size_t i=0; i<ldkv; i++) vm[i] /= (float)seq_k;
+        }
+    }
+    // Mask in the score layout, per query block: BLOCK -> -inf, padded keys -inf.
+    if (use_mp) {
+#if defined(_OPENMP)
+        #pragma omp for schedule(static) collapse(2)
+#endif
+        for (int blk=0; blk<qblocks; blk++)
+            for (size_t k8=0; k8<K8p; k8++) {
+                float* d = mp + ((size_t)blk*K8p + k8)*SLAB;
+                for (int r=0; r<QB; r++) {
+                    const int q = blk*QB + r;
+                    for (int c=0; c<8; c++) {
+                        const size_t key = k8*8 + c;
+                        float m = 0.0f;
+                        if (key >= (size_t)seq_k) m = NINF;
+                        else if (mask && q < seq_q) {
+                            m = mask[(size_t)q*seq_k + key];
+                            if (m == BLOCK) m = NINF;
+                        }
+                        d[(size_t)r*8 + c] = m;
+                    }
+                }
+            }
+    }
+#if defined(_OPENMP)
+    #pragma omp barrier
+#endif
+
+    // Flash-style: keys in chunks of KC so the chunk's scores, P and the output
+    // accumulators stay in L1 (a 1024-key score block is 128 KB; streaming it
+    // through L2 made the softmax 3x slower per element on the A100). Running
+    // row max mrow and sum lrow; the output accumulator is rescaled by
+    // alpha = exp(m_old - m_new) per chunk.
+    constexpr size_t KC = 128;                      // keys per chunk (multiple of 16)
+    const size_t KC8 = KC/8;
+    std::vector<_Float16> qp(K8q*SLAB), pp(KC8*SLAB);
+    std::vector<float> sp(KC8*SLAB), oacc(NBD*2*SLAB);
+    alignas(64) float acc[64*MT], rowv[64*MT], alphav[2*64*MT], c[MT*2*64];
+    float mrow[8*MT], lrow[8*MT], alpha[8*MT];
+#if defined(_OPENMP)
+    #pragma omp for schedule(dynamic, 1) collapse(2)
+#endif
+    for (int h=0; h<n_q; h++)
+        for (int blk=0; blk<qblocks; blk++) {
+            const int kv  = h/group;
+            const int b0  = blk*QB;
+            const int nbq = seq_q - b0 < QB ? seq_q - b0 : QB;
+
+            // scale*Q -> [K8q][MT][64], written in order; rows past seq_q are zero.
+            {
+                _Float16* d = qp.data();
+                for (size_t k8=0; k8<K8q; k8++)
+                    for (int r=0; r<QB; r++, d += 8) {
+                        if (r >= nbq) { std::memset(d, 0, 16); continue; }
+                        const float* src = Q + ((size_t)(b0 + r)*n_q + h)*head_dim + k8*8;
+                        for (int cc=0; cc<8; cc++) d[cc] = (_Float16)(src[cc]*scale);
+                    }
+            }
+            for (int r=0; r<QB; r++) { mrow[r] = NINF; lrow[r] = 0.0f; }
+            std::memset(oacc.data(), 0, oacc.size()*sizeof(float));
+
+            const _Float16* kph = kp + kv*kp_n;
+            const _Float16* vth = vt + kv*vt_n;
+            const float* mpb = mp ? mp + (size_t)blk*K8p*SLAB : nullptr;
+            for (size_t c0=0; c0<SKP; c0+=KC) {
+                const size_t kc  = SKP - c0 < KC ? SKP - c0 : KC;
+                const size_t nk8 = kc/8, g0 = c0/8;
+                // S chunk = Q K^T, straight into [nk8][MT][64].
+                for (size_t nb=0; nb<kc/16; nb++)
+                    ime_tile(sp.data() + nb*2*SLAB, qp.data(), kph + (c0/16 + nb)*K8q*128, K8q, SLAB, 64);
+
+                // Mask; slab-wise max -> per-row chunk max -> running max.
+                for (size_t i = 0; i < SLAB;) {
+                    const size_t vl = __riscv_vsetvl_e32m4(SLAB - i);
+                    vfloat32m4_t mx = __riscv_vfmv_v_f_f32m4(NINF, vl);
+                    for (size_t k8=0; k8<nk8; k8++) {
+                        float* s = sp.data() + k8*SLAB + i;
+                        vfloat32m4_t x = __riscv_vle32_v_f32m4(s, vl);
+                        if (mpb) {
+                            x = __riscv_vfadd_vv_f32m4(x, __riscv_vle32_v_f32m4(mpb + (g0 + k8)*SLAB + i, vl), vl);
+                            __riscv_vse32_v_f32m4(s, x, vl);
+                        }
+                        mx = __riscv_vfmax_vv_f32m4(mx, x, vl);
+                    }
+                    __riscv_vse32_v_f32m4(acc + i, mx, vl);
+                    i += vl;
+                }
+                for (int r=0; r<QB; r++) {
+                    float m = mrow[r];
+                    for (int cc=0; cc<8; cc++) m = acc[r*8 + cc] > m ? acc[r*8 + cc] : m;
+                    alpha[r] = mrow[r] == NINF ? 0.0f : std::exp(mrow[r] - m);
+                    mrow[r] = m;
+                    const float ref = m == NINF ? 0.0f : m;   // all blocked so far: P -> 0
+                    for (int cc=0; cc<8; cc++) rowv[r*8 + cc] = ref;
+                }
+
+                // P = exp(S - m) -> fp16 [nk8][MT][64]; slab-wise sums -> running sums.
+                for (size_t i = 0; i < SLAB;) {
+                    const size_t vl = __riscv_vsetvl_e32m4(SLAB - i);
+                    const vfloat32m4_t mv = __riscv_vle32_v_f32m4(rowv + i, vl);
+                    const vfloat32m4_t c1 = __riscv_vfmv_v_f_f32m4(0.6931280494f, vl);
+                    const vfloat32m4_t c2 = __riscv_vfmv_v_f_f32m4(0.2402367741f, vl);
+                    const vfloat32m4_t c3 = __riscv_vfmv_v_f_f32m4(0.0558702424f, vl);
+                    const vfloat32m4_t c4 = __riscv_vfmv_v_f_f32m4(0.0095902430f, vl);
+                    vfloat32m4_t sum = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+                    for (size_t k8=0; k8<nk8; k8++) {
+                        const vfloat32m4_t e = exp_softmax(__riscv_vfsub_vv_f32m4(
+                            __riscv_vle32_v_f32m4(sp.data() + k8*SLAB + i, vl), mv, vl), c1, c2, c3, c4, vl);
+                        sum = __riscv_vfadd_vv_f32m4(sum, e, vl);
+                        __riscv_vse16_v_f16m2(pp.data() + k8*SLAB + i, __riscv_vfncvt_f_f_w_f16m2(e, vl), vl);
+                    }
+                    __riscv_vse32_v_f32m4(acc + i, sum, vl);
+                    i += vl;
+                }
+                for (int r=0; r<QB; r++) {
+                    float z = 0.0f;
+                    for (int cc=0; cc<8; cc++) z += acc[r*8 + cc];
+                    lrow[r] = lrow[r]*alpha[r] + z;
+                }
+                // alpha in the [MT][2][64] output layout: element (t, h, r, col) -> row t*8+r.
+                for (int t=0; t<MT; t++)
+                    for (int hh=0; hh<2; hh++)
+                        for (int r=0; r<8; r++)
+                            for (int cc=0; cc<8; cc++) alphav[((t*2 + hh)*8 + r)*8 + cc] = alpha[t*8 + r];
+
+                // O = O*alpha + P V_chunk, 16 head dims per call.
+                for (size_t nb=0; nb<NBD; nb++) {
+                    ime_tile(c, pp.data(), vth + (nb*K8p + g0)*128, nk8);
+                    float* o = oacc.data() + nb*2*SLAB;
+                    for (size_t i = 0; i < 2*SLAB;) {
+                        const size_t vl = __riscv_vsetvl_e32m4(2*SLAB - i);
+                        __riscv_vse32_v_f32m4(o + i, __riscv_vfmacc_vv_f32m4(
+                            __riscv_vle32_v_f32m4(c + i, vl), __riscv_vle32_v_f32m4(o + i, vl),
+                            __riscv_vle32_v_f32m4(alphav + i, vl), vl), vl);
+                        i += vl;
+                    }
+                }
+            }
+
+            // out = O / l; a row whose every key was blocked gets the mean of V
+            // (uniform weights, as the RVV kernel), in fp32.
+            for (int r=0; r<nbq; r++) {
+                float* o = out + ((size_t)(b0 + r)*n_q + h)*head_dim;
+                if (mrow[r] == NINF) {
+                    std::memcpy(o, vm + (size_t)kv*head_dim, head_dim*sizeof(float));
+                    continue;
+                }
+                const float il = 1.0f/lrow[r];
+                const int t = r/8, rr = r%8;
+                for (size_t nb=0; nb<NBD; nb++)
+                    for (int hh=0; hh<2; hh++) {
+                        const float* src = oacc.data() + nb*2*SLAB + ((t*2 + hh)*8 + rr)*8;
+                        for (int cc=0; cc<8; cc++) o[nb*16 + hh*8 + cc] = src[cc]*il;
+                    }
+            }
+        }
+  }
+    return true;
+}
+
 } // namespace tcpu
 
 #endif // TCPU_HAL_RVV && TCPU_RVV_IME
+

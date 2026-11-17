@@ -15,7 +15,8 @@
 // backend ships; blocked keys flush to weight exactly 0). AV walks keys with the
 // head_dim strip of each V row loaded once and FMA'd into all QT outputs; keys
 // whose weight is zero in every row of the tile are skipped. The dense op comes
-// from hal/common/attn.cpp (this path with a zero mask).
+// from hal/common/attn.cpp (this path with a zero mask). With TCPU_IME=1 on the
+// A100 cores, ime_attention (hal/rvv/ime.cpp) takes the call instead.
 //
 // K^T and score rows are padded by ROW_PAD floats. At seq_k = 1024 (the SigLIP
 // ViT) an unpadded row is exactly 4 KB, so the head_dim rows of a QK slice and
@@ -159,6 +160,7 @@ inline void av_tile(float* const* o, const float* w, size_t scs, int rows, const
 void gqa_attention_masked(float* out, const float* Q, const float* K, const float* V,
                           int seq_q, int seq_k, int n_q, int n_kv, int head_dim,
                           float scale, const float* mask, const float*) {
+    if (ime_attention(out, Q, K, V, seq_q, seq_k, n_q, n_kv, head_dim, scale, mask)) return;
     const int group  = n_q/n_kv;
 
     // V packed per kv head into head_dim strips of DS floats, keys contiguous:

@@ -138,6 +138,16 @@ void pack_weights_ime_bf16(const uint16_t* Wb16, uint16_t* Wh, int N, int K);
 void dense_linear_ime(float* out, const float* x, const uint16_t* Wh, const float* bias,
                       int seq, int N, int K);
 
+// IME2 attention: gqa_attention_masked's semantics with QK^T and PV on vfwmadot
+// (fp16 Q, K, V and softmax numerators; fp32 softmax and accumulation). Active
+// when ime_available() and TCPU_IME_ATTN is not 0; returns false, doing nothing,
+// when inactive or head_dim is not a multiple of 16 up to 256. The RVV gqa_attention_masked
+// tries it first.
+bool ime_attention_enabled();
+bool ime_attention(float* out, const float* Q, const float* K, const float* V,
+                   int seq_q, int seq_k, int n_q, int n_kv, int head_dim,
+                   float scale, const float* mask);
+
 // Same GEMM, output stored TRANSPOSED: out_t[n*ldo + t] (in-register 8x8 transpose
 // epilogue, masked stores). Produces attention's K^T layout straight from the K
 // projection, skipping the separate transpose pass. Same accumulation order as

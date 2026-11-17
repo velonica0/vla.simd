@@ -127,6 +127,10 @@ bool bf16_deq();
 // has no IME.
 bool ime();
 
+// TCPU_IME_ATTN=0: with TCPU_IME=1, keep attention on the RVV kernel instead of
+// the IME2 one (default on; ignored without IME).
+bool ime_attn();
+
 // TCPU_GEMM_SCHED=static reverts the Pi packed GEMMs to static scheduling
 // (dynamic whole-panel is the measured ARM default).
 bool gemm_force_static();

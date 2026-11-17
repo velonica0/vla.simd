@@ -265,6 +265,8 @@ static void test_attention() {
         const int sq = c[0], sk = c[1], nq = c[2], nkv = c[3], hd = c[4];
         auto Q = rv((size_t)sq*nq*hd), K = rv((size_t)sk*nkv*hd), V = rv((size_t)sk*nkv*hd);
         const float scale = 1.0f/std::sqrt((float)hd);
+        // IME attention rounds Q, K, V and the softmax weights to fp16.
+        const double tol = ime_attention_enabled() && hd % 16 == 0 ? 3e-3 : 2e-6;
         std::vector<float> dense((size_t)sq*nq*hd), masked(dense.size()), zero((size_t)sq*sk, 0.f);
         gqa_attention_dense(dense.data(), Q.data(), K.data(), V.data(), sq, sk, nq, nkv, hd, scale);
         gqa_attention_masked(masked.data(), Q.data(), K.data(), V.data(), sq, sk, nq, nkv, hd, scale, zero.data());
@@ -273,14 +275,14 @@ static void test_attention() {
         std::vector<double> ref;
         naive_attention(ref, Q.data(), K.data(), V.data(), nullptr, sq, sk, nq, nkv, hd, scale);
         std::vector<double> one(ref.size(), 1.0);
-        expect_close("gqa_attention_dense", dense, ref, one, 2e-6);
+        expect_close("gqa_attention_dense", dense, ref, one, tol);
 
         std::vector<float> causal((size_t)sq*sk);
         for (int i = 0; i < sq; i++)
             for (int j = 0; j < sk; j++) causal[(size_t)i*sk+j] = j > i + (sk - sq) ? NINF : 0.f;
         gqa_attention_masked(masked.data(), Q.data(), K.data(), V.data(), sq, sk, nq, nkv, hd, scale, causal.data());
         naive_attention(ref, Q.data(), K.data(), V.data(), causal.data(), sq, sk, nq, nkv, hd, scale);
-        expect_close("gqa_attention_masked causal", masked, ref, one, 2e-6);
+        expect_close("gqa_attention_masked causal", masked, ref, one, tol);
 
         const int ldk = hal::kt_stride(sk);
         std::vector<float> KT((size_t)nkv*hd*ldk, 0.f), pre(masked.size());
@@ -289,7 +291,7 @@ static void test_attention() {
                 for (int j = 0; j < sk; j++) KT[((size_t)h*hd+d)*ldk+j] = K[((size_t)j*nkv+h)*hd+d];
         gqa_attention_masked(pre.data(), Q.data(), K.data(), V.data(), sq, sk, nq, nkv, hd, scale,
                              causal.data(), KT.data());
-        expect_close("gqa_attention_masked causal K_pre", pre, ref, one, 2e-6);
+        expect_close("gqa_attention_masked causal K_pre", pre, ref, one, tol);
         CHECK(TCPU_HAL_APPLE || same_bits(pre, masked),
               "masked with K_pre != masked (%d,%d,%d,%d,%d)", sq, sk, nq, nkv, hd);
         for (float block : {NINF, std::numeric_limits<float>::lowest()}) {
@@ -301,7 +303,7 @@ static void test_attention() {
                         double mean = 0;
                         for (int j=0; j<sk; j++) mean += V[((size_t)j*nkv+h/(nq/nkv))*hd+d]/(double)sk;
                         const float value = masked[((size_t)t*nq+h)*hd+d];
-                        CHECK(std::isfinite(value) && std::fabs(value-mean) < 2e-6,
+                        CHECK(std::isfinite(value) && std::fabs(value-mean) < tol,
                               "fully masked attention differs from uniform fallback");
                     }
         }
