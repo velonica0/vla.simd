@@ -211,6 +211,16 @@ bool ime_tcm() {
     return v;
 }
 
+bool ime_i8() {
+    static const bool v = flag_on("TCPU_IME_I8", true);
+    return v;
+}
+
+bool ime_i8_verbose() {
+    static const bool v = std::getenv("TCPU_IME_I8") != nullptr;
+    return v;
+}
+
 bool gemm_force_static() {
     static const bool v = [] {
         const char* e = std::getenv("TCPU_GEMM_SCHED");

@@ -116,6 +116,26 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
       message(STATUS "vla_simd HAL: rvv, no IME (assembler lacks vfwmadot)")
     endif()
   endif()
+  # SpacemiT IME integer kernel (vmadot) for the W8A8 GEMM: only
+  # src/hal/rvv/gemm_i8.cpp is built with _xsmtvdot, and the instruction is
+  # probed at run time.
+  option(VLA_RVV_IME_I8 "build the SpacemiT IME int8 GEMM (vmadot)" ON)
+  if(VLA_RVV_IME_I8)
+    include(CheckCXXSourceCompiles)
+    set(VLA_RVV_IME_I8_FLAGS "${VLA_RVV_FLAGS}_xsmtvdot")
+    set(CMAKE_REQUIRED_FLAGS "${VLA_RVV_IME_I8_FLAGS}")
+    check_cxx_source_compiles("int main() { __asm__ volatile(\"vmadot v2, v0, v1\"); }"
+                              VLA_RVV_HAVE_VMADOT)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(VLA_RVV_HAVE_VMADOT)
+      target_compile_definitions(vla_flags INTERFACE TCPU_RVV_IME_I8=1)
+      separate_arguments(VLA_RVV_IME_I8_FLAG_LIST NATIVE_COMMAND "${VLA_RVV_IME_I8_FLAGS}")
+      set_source_files_properties(src/hal/rvv/gemm_i8.cpp PROPERTIES COMPILE_OPTIONS "${VLA_RVV_IME_I8_FLAG_LIST}")
+      message(STATUS "vla_simd HAL: rvv + IME int8 vmadot")
+    else()
+      message(STATUS "vla_simd HAL: rvv, no int8 kernel (assembler lacks vmadot)")
+    endif()
+  endif()
 else()
   message(STATUS "vla_simd HAL: scalar (${CMAKE_SYSTEM_PROCESSOR})")
 endif()
@@ -217,6 +237,7 @@ add_library(tcpu_ops STATIC
   src/hal/rvv/gemm.cpp
   src/hal/rvv/attn.cpp
   src/hal/rvv/ime.cpp
+  src/hal/rvv/gemm_i8.cpp
   src/hal/scalar/gemm.cpp
   src/hal/scalar/attn.cpp
   src/hal/common/eltwise.cpp

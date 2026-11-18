@@ -51,6 +51,8 @@ int i8_kpad(int K);
 // 8 output rows). Requires N % 16 == 0.
 //
 // The buffer carries an int32 row-sum table after the panels - see i8_rowsums.
+// RVV builds with the SpacemiT IME kernel append a tile-order copy of the same
+// int8 values after that table for vmadot (src/hal/rvv/gemm_i8.cpp).
 // Same buffer counted in int32 words. Owners allocate std::vector<int32_t> and
 // hand out (int8_t*): the row-sum table is then read as the int32 objects it is,
 // instead of punned out of int8 storage.

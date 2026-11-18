@@ -140,6 +140,14 @@ bool ime_f16();
 // processes using it at once corrupt each other, and its threads pin to cores.
 bool ime_tcm();
 
+// TCPU_IME_I8=0: on RVV builds with the integer IME kernel (TCPU_RVV_IME_I8),
+// report no int8 GEMM, so W8A8 requests keep their fp32 path. Default on: the
+// kernel is exact against the int8 reference and runs on the K3's X100 cores
+// (vmadot 4x4x8) and A100 cores (8x8x16). Setting the variable at all also
+// prints which tile was selected.
+bool ime_i8();
+bool ime_i8_verbose();
+
 // TCPU_GEMM_SCHED=static reverts the Pi packed GEMMs to static scheduling
 // (dynamic whole-panel is the measured ARM default).
 bool gemm_force_static();

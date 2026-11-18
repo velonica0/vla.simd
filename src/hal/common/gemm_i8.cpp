@@ -16,6 +16,8 @@
 #include <arm_neon.h>
 #elif TCPU_HAL_X86
 #include <immintrin.h>
+#elif TCPU_HAL_RVV
+#include <riscv_vector.h>
 #endif
 #include <cassert>
 #include <cmath>
@@ -27,6 +29,16 @@ using std::size_t;
 
 namespace tcpu {
 
+#if TCPU_HAL_RVV && TCPU_RVV_IME_I8
+// src/hal/rvv/gemm_i8.cpp: the vmadot kernel keeps a tile-order copy of the
+// quantized weights after the row-sum table.
+size_t i8_ime_bytes(int N, int K);
+void i8_ime_pack(int8_t* dst, const int8_t* Wq, int N, int K);
+#else
+static size_t i8_ime_bytes(int, int) { return 0; }
+static void i8_ime_pack(int8_t*, const int8_t*, int, int) {}
+#endif
+
 int i8_kpad(int K) { return (K+3) & ~3; }
 
 // panels, then one int32 per output row. N*Kp is a multiple of 4 (Kp is), so the
@@ -35,7 +47,7 @@ static size_t i8_panel_bytes(int N, int K) { return (size_t)N*i8_kpad(K); }
 
 size_t packed_i8_words(int N, int K) {
     // panel bytes are a multiple of 4
-    return (i8_panel_bytes(N, K) + (size_t)N*sizeof(int32_t))/sizeof(int32_t);
+    return (i8_panel_bytes(N, K) + (size_t)N*sizeof(int32_t) + i8_ime_bytes(N, K) + 3)/sizeof(int32_t);
 }
 
 const int32_t* i8_rowsums(const int8_t* Wq, int N, int K) {
@@ -86,6 +98,7 @@ void pack_weights_i8(const float* W, int8_t* Wq, float* wscale, int N, int K) {
         }
         rowsum[n] = sum;   // padding lanes are zero, so they do not contribute
     }
+    i8_ime_pack((int8_t*)(rowsum + N), Wq, N, K);
 }
 
 #if TCPU_ISA_ARM
@@ -171,6 +184,34 @@ static inline void quantize_row_avx2(const float* xt, int8_t* q, float* scale, i
 }
 #endif
 
+#if TCPU_HAL_RVV
+// RVV absmax + convert. vfcvt.x.f rounds to nearest even under the default
+// frm, as lrint does; the saturating narrows never clip because |x|/s <= 127.
+static inline void quantize_row_rvv(const float* xt, int8_t* q, float* scale, int K, int Kp) {
+    const size_t vlmax = __riscv_vsetvlmax_e32m4();
+    vfloat32m4_t m = __riscv_vfmv_v_f_f32m4(0.0f, vlmax);
+    for (size_t k = 0; k < (size_t)K;) {
+        const size_t vl = __riscv_vsetvl_e32m4((size_t)K - k);
+        m = __riscv_vfmax_vv_f32m4_tu(m, m, __riscv_vfabs_v_f32m4(__riscv_vle32_v_f32m4(xt + k, vl), vl), vl);
+        k += vl;
+    }
+    const float amax = __riscv_vfmv_f_s_f32m1_f32(
+        __riscv_vfredmax_vs_f32m4_f32m1(m, __riscv_vfmv_s_f_f32m1(0.0f, 1), vlmax));
+    const float s = amax > 0.0f ? std::max(amax/127.0f, std::numeric_limits<float>::min()) : 1.0f;
+    *scale = s;
+    const float inv = 1.0f/s;
+    for (size_t k = 0; k < (size_t)K;) {
+        const size_t vl = __riscv_vsetvl_e32m4((size_t)K - k);
+        const vint32m4_t i = __riscv_vfcvt_x_f_v_i32m4(
+            __riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(xt + k, vl), inv, vl), vl);
+        const vint16m2_t h = __riscv_vnclip_wx_i16m2(i, 0, __RISCV_VXRM_RNU, vl);
+        __riscv_vse8_v_i8m1(q + k, __riscv_vnclip_wx_i8m1(h, 0, __RISCV_VXRM_RNU, vl), vl);
+        k += vl;
+    }
+    for (int k = K; k < Kp; k++) q[k] = 0;
+}
+#endif
+
 // The row quantizers need no clamp: |x|/s <= 127. Conv scales by
 // TCPU_I8_CLIP <= 1, so x*inv can exceed 127 and the saturating narrows land on
 // -128 where q8 gives -127. Clamp in fp32 first.
@@ -202,6 +243,15 @@ void quantize_span_i8(const float* x, int8_t* q, size_t n, float inv) {
         _mm256_storeu_si256((__m256i*)(q+i),
                             _mm256_permutevar8x32_epi32(_mm256_packs_epi16(a, b), ord));
     }
+#elif TCPU_HAL_RVV
+    while (i < n) {
+        const size_t vl = __riscv_vsetvl_e32m4(n - i);
+        vfloat32m4_t v = __riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(x + i, vl), inv, vl);
+        v = __riscv_vfmin_vf_f32m4(__riscv_vfmax_vf_f32m4(v, -127.0f, vl), 127.0f, vl);
+        const vint16m2_t h = __riscv_vnclip_wx_i16m2(__riscv_vfcvt_x_f_v_i32m4(v, vl), 0, __RISCV_VXRM_RNU, vl);
+        __riscv_vse8_v_i8m1(q + i, __riscv_vnclip_wx_i8m1(h, 0, __RISCV_VXRM_RNU, vl), vl);
+        i += vl;
+    }
 #endif
     for (; i<n; i++) q[i] = q8(x[i]*inv);
 }
@@ -221,6 +271,13 @@ void quantize_act_i8(const float* x, int8_t* xq, float* ascale, int seq, int K) 
 #endif
     for (int t=0; t<seq; t++)
         quantize_row_avx2(x+(size_t)t*K, xq+(size_t)t*Kp, ascale+t, K, Kp);
+    return;
+#elif TCPU_HAL_RVV
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static) if((size_t)seq*K > (size_t)hal::env::omp_min())
+#endif
+    for (int t=0; t<seq; t++)
+        quantize_row_rvv(x+(size_t)t*K, xq+(size_t)t*Kp, ascale+t, K, Kp);
     return;
 #endif
 #if defined(_OPENMP)
@@ -280,7 +337,7 @@ void dense_linear_i8_ref(float* out, const int8_t* xq, const float* ascale,
     }
 }
 
-#if !TCPU_ISA_ARM && !TCPU_HAL_X86
+#if !TCPU_ISA_ARM && !TCPU_HAL_X86 && !(TCPU_HAL_RVV && TCPU_RVV_IME_I8)
 // No vector int8 on this backend: callers keep their fp32 path, and the
 // reference stands in for anything that calls the entry point anyway.
 bool int8_gemm_available() { return false; }
@@ -290,6 +347,6 @@ void dense_linear_i8_pre(float* out, const int8_t* xq, const float* ascale,
                          int seq, int N, int K) {
     dense_linear_i8_ref(out, xq, ascale, Wq, wscale, bias, seq, N, K);
 }
-#endif // !TCPU_ISA_ARM && !TCPU_HAL_X86
+#endif // no int8 kernel on this backend
 
 } // namespace tcpu

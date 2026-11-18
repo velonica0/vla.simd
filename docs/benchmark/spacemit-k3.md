@@ -145,6 +145,39 @@ ViT layer (1024 tokens, 12 heads) takes 13 ms, against 64 ms for the RVV kernel 
 Commits: `d99ab7b` and `4b06998` on `ime-backend`. `4b06998` adds the fp16 range handling and gives
 bit-identical actions to `d99ab7b` on the recorded requests.
 
+## ACT INT8 with the IME integer kernel
+
+SpacemiT's IME also has an integer matrix instruction, `vmadot`: an M×M int32 tile accumulates
+the product of M rows of int8 activations and M rows of int8 weights. Both clusters execute it,
+with the tile set by the vector length: 4×4 over 8 values of k on the X100 cores (128
+multiply-adds per instruction) and 8×8 over 16 on the A100 cores (1,024). `src/hal/rvv/gemm_i8.cpp`
+is the W8A8 GEMM on it, so `--int8` now works on RISC-V; before, the RVV backend had no int8
+kernel and reported INT8 as unavailable. It is on by default where `vmadot` executes
+(`TCPU_IME_I8=0` turns it off) and matches the scalar int8 reference bit for bit.
+
+| ACT (`act-so101-multi-task.gguf`), 8 threads | Median (ms) | p10 | p90 | Max / mean action difference vs FP32 |
+| --- | --- | --- | --- | --- |
+| X100, FP32 | 620.1 | 598.1 | 641.1 | reference |
+| X100, INT8 (`--int8 63`) | 212.4 | 205.4 | 237.0 | 4.06 / 0.16 |
+| A100, FP32 | 1,713 | 1,708 | 1,717 | 2.3e-5 / 2.7e-6 |
+| A100, INT8 (`--int8 63`) | 308.6 | 308.1 | 309.3 | 3.97 / 0.16 |
+| A100, INT8 with `TCPU_IME=1` | 220.0 | 219.5 | 220.5 | 4.08 / 0.16 |
+
+2 warmup and 50 timed queries (10 for A100 FP32) of `policy_server --bench` on 2026-11-17. Actions
+are un-normalized joint targets spanning -59 to 157 in these queries; cosine similarity to FP32 is
+0.99999 for every INT8 row. The INT8 rows differ from each other because the FP32 layers between
+the int8 GEMMs round differently on the two clusters, which moves a few quantized values. The
+last row runs the attention scores on the IME2 fp16 kernel as well; without it the A100 cores
+spend 108 ms of the 309 in FP32 attention.
+
+The tile loop is bound by loading its operands, not by `vmadot` (about one cycle on the X100
+cores, 0.7 ns on the A100 cores): in L1 a core reaches 185 G multiply-adds/s on the X100 and 480
+on the A100. The X100 cores load one register at a time; the A100 cores need wide loads, as in
+the fp16 kernel. The kernel reads a byte of operands per five multiply-adds, so the driver is
+blocked like a BLAS GEMM (64-row groups, K in 512-byte chunks) to keep the inner loop in the 64
+KB L1; unblocked, ACT took 271 ms on the X100 cores. What is left on the X100 cores is mostly
+outside the int8 GEMM: FP32 attention (about 70 ms), quantization, im2col and the float epilogue.
+
 ## Task success (LIBERO)
 
 The latency rows above use the SO-101 checkpoint, which has no simulator. To check that the K3
