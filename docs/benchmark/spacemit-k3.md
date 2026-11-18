@@ -4,7 +4,10 @@ With the fastest configuration, FP32 median latency is 805.0 ms for TurboVLA and
 on the eight X100 cores, about 2× the Raspberry Pi 5 for both. The opt-in BF16 path
 (`TCPU_BF16_DEQ=0`) brings SmolVLA to 4,195 ms. Only these two models were run. The opt-in IME2
 path on the eight A100 cores (`TCPU_IME=1`) brings a chunk to about 2.1 s for SmolVLA and 346 ms for
-TurboVLA; see [A100 cores with IME2](#a100-cores-with-ime2-opt-in). In closed-loop LIBERO, TurboVLA
+TurboVLA, and with fp16 tile tensors and the cores' TCM to 1.1 s and 160 ms; see
+[A100 cores with IME2](#a100-cores-with-ime2-opt-in). ACT INT8, on the IME integer kernel, takes
+212 ms on the X100 cores against 620 ms for FP32; see
+[ACT INT8](#act-int8-with-the-ime-integer-kernel). In closed-loop LIBERO, TurboVLA
 succeeds in every episode on the X100 cores, the A100 cores and vla.cpp on a GPU (40/40 each), and
 SmolVLA on the K3 stays within run-to-run variation of vla.cpp and of the PyTorch reference; see
 [Task success](#task-success-libero).
@@ -145,6 +148,42 @@ ViT layer (1024 tokens, 12 heads) takes 13 ms, against 64 ms for the RVV kernel 
 Commits: `d99ab7b` and `4b06998` on `ime-backend`. `4b06998` adds the fp16 range handling and gives
 bit-identical actions to `d99ab7b` on the recorded requests.
 
+### fp16 tile tensors and TCM
+
+Commit `c9dff97` keeps the SigLIP and DINOv3 encoder layers in fp16 in the tile layout `vfwmadot`
+reads, `[rows/32][K/8][4][8][8]`, so a Linear needs no conversion in or out; LayerNorm, GELU, the
+residual add, the rotary embedding and attention work on that layout, and only sums are fp32
+(`TCPU_IME_F16`, on by default with `TCPU_IME=1`). An encoder whose values leave the fp16 range
+reruns in FP32. The tile kernels also load their operands with wide vector loads: the loop was
+bound by its six 128-byte loads per step, not by `vfwmadot`.
+
+`TCPU_IME_TCM=1` additionally holds the operand each thread re-reads in that core's TCM
+(`/dev/tcm`, 384 KB of SRAM per A100 core): its chunk of activation rows for a GEMM, and one head's
+K and V for attention. It is opt-in because the driver has no allocator, so two processes would
+overwrite each other; a second vla.simd process is refused and runs without it.
+
+| Per chunk, A100 cores | Threads | SmolVLA (LIBERO checkpoint) | TurboVLA |
+| --- | --- | --- | --- |
+| IME GEMM and attention, FP32 tensors (`4b06998`) | 8 | 2,113 ms | 330 ms |
+| fp16 tile tensors | 8 | 1,616 ms | 221 ms |
+| fp16 tile tensors and TCM | 8 | 1,097 ms (1,130) | 160 ms (160.7) |
+| fp16 tile tensors and TCM | 4 | about 1,780 ms | 228 ms (254) |
+| Max action difference vs FP32, fp16 tiles | | 1.4e-3 | 1.8e-3 |
+
+Medians of 3 to 8 benchmark queries; in parentheses, sustained serving: 495 back-to-back SmolVLA
+requests and 3,600 TurboVLA queries at 8 threads (2026-11-17, ten minutes each), and the mean
+request of the LIBERO-Long runs below at 4 threads. Actions are bit-identical with TCM on or off
+and across thread counts. SmolVLA's language-model prefill and action expert (about 700 ms of the
+1,097) and TurboVLA's fusion stage still pass FP32 tensors between the IME2 GEMMs, and the
+attention softmax is FP32.
+
+Power: on the board's first power supply, SmolVLA at 8 threads with TCM reset the board 10 to 18
+seconds into sustained serving, twice; 4 threads with TCM, and 8 threads without it, did not. On
+a replacement supply the same 8-thread load ran for ten minutes per model, twice. During the
+first of those two runs an `sshd` and a `dbus-daemon` process segfaulted and the board reset 2.5
+minutes after the load ended; the second run was clean. The cause is not established, so the
+LIBERO-Long runs below used 4 threads.
+
 ## ACT INT8 with the IME integer kernel
 
 SpacemiT's IME also has an integer matrix instruction, `vmadot`: an M×M int32 tile accumulates
@@ -258,6 +297,22 @@ the A100 cores and 4.1 to 5.2 s on the X100 cores. With 10 actions per chunk at 
 (0.5 s), the K3 is 4 to 10× too slow to keep up with a real control loop. TurboVLA's 12-action chunk
 lasts 0.6 s, which the A100 cores (376 ms) keep up with and the X100 cores (837 ms) do not. In
 simulation the client waits for every chunk, so speed only lengthens each episode.
+
+### LIBERO-Long on the A100 cores
+
+LIBERO-Long (`libero_10`), 10 tasks × 20 episodes, same client and checkpoints as above, served
+from the A100 cores with fp16 tile tensors and TCM at 4 threads (`c9dff97`, 2026-11-17 02:00 to
+09:35 UTC-8, 7.5 hours without a reset).
+
+| Model | Task 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | Total | Inference per env step |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| TurboVLA | 18 | 20 | 20 | 18 | 20 | 19 | 19 | 18 | 19 | 20 | 191/200 (95.5%) | 33 ms |
+| SmolVLA | 5 | 9 | 4 | 15 | 1 | 11 | 8 | 1 | 6 | 13 | 73/200 (36.5%) | 215 ms |
+
+Successes out of 20. TurboVLA's tasks 0 to 3 match a partial run of the earlier IME2 build
+(`4b06998`, 8 threads): 18, 20, 20, 18. SmolVLA has no LIBERO-Long reference on any engine here,
+so its 36.5% cannot be attributed to the checkpoint or to the fp16 path; open loop, the build's
+actions are within 1.4e-3 of FP32.
 
 ### Serving vla.simd to vla.cpp's clients
 
